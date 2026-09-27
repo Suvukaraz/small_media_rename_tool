@@ -1,0 +1,17 @@
+# Binaries
+smrt
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+*.out
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
