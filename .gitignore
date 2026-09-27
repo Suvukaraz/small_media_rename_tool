@@ -1,5 +1,7 @@
 # Binaries
 smrt
+dist/
+bin/
 *.exe
 *.exe~
 *.dll
