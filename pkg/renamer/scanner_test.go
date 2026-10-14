@@ -743,8 +743,98 @@ func TestTVShowSubtitleConversionEndToEnd(t *testing.T) {
 	}
 }
 
+func TestMonsterLizzieBorden(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "smrt_lizzie_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
 
+	serienDir := filepath.Join(tempDir, "serien")
+	showDir := filepath.Join(serienDir, "Monster - The Lizzie Borden Story (2026)")
+	_ = os.MkdirAll(showDir, 0755)
 
+	// Episode files
+	ep1 := filepath.Join(showDir, "Monster.The.Lizzie.Borden.Story.S01E01.720p.mkv")
+	ep2 := filepath.Join(showDir, "Monster.The.Lizzie.Borden.Story.S01E02.720p.mkv")
+	_ = os.WriteFile(ep1, []byte("ep1"), 0644)
+	_ = os.WriteFile(ep2, []byte("ep2"), 0644)
+
+	scanner := NewScanner(SeparatorSpace)
+
+	// Case A: scanning serenDir via ScanPaths("", serienDir)
+	resA, err := scanner.ScanPaths("", serienDir)
+	if err != nil {
+		t.Fatalf("ScanPaths failed: %v", err)
+	}
+	t.Logf("Case A Actions (%d):", len(resA.Actions))
+	for _, a := range resA.Actions {
+		t.Logf("  Action: %v | %s -> %s", a.Type, a.SourcePath, a.TargetPath)
+	}
+
+	// Case B: scanning showDir directly via ScanPaths("", showDir)
+	resB, err := scanner.ScanPaths("", showDir)
+	if err != nil {
+		t.Fatalf("ScanPaths B failed: %v", err)
+	}
+	t.Logf("Case B Actions (%d):", len(resB.Actions))
+	for _, a := range resB.Actions {
+		t.Logf("  Action: %v | %s -> %s", a.Type, a.SourcePath, a.TargetPath)
+	}
+
+	// Case D: files inside Season 1 subfolder, scanned via Scan(showDir)
+	seasonDir := filepath.Join(showDir, "Season 1")
+	_ = os.MkdirAll(seasonDir, 0755)
+	ep3 := filepath.Join(seasonDir, "Monster.The.Lizzie.Borden.Story.S01E03.mkv")
+	_ = os.WriteFile(ep3, []byte("ep3"), 0644)
+	resD, err := scanner.Scan(showDir)
+	if err != nil {
+		t.Fatalf("Scan D failed: %v", err)
+	}
+	t.Logf("Case D Actions (%d):", len(resD.Actions))
+	for _, a := range resD.Actions {
+		t.Logf("  Action: %v | %s -> %s", a.Type, a.SourcePath, a.TargetPath)
+	}
+
+	// Case F: showDir has NO files in root, ONLY files in Season 1 subfolder, scanned with Scan(showDir2)
+	showDir2 := filepath.Join(serienDir, "Monster - The Lizzie Borden Story (2026) 2")
+	s1Dir := filepath.Join(showDir2, "Staffel 1")
+	_ = os.MkdirAll(s1Dir, 0755)
+	epS1 := filepath.Join(s1Dir, "Monster.The.Lizzie.Borden.Story.S01E01.mkv")
+	_ = os.WriteFile(epS1, []byte("eps1"), 0644)
+	resF, err := scanner.Scan(showDir2)
+	if err != nil {
+		t.Fatalf("Scan F failed: %v", err)
+	}
+	t.Logf("Case F Actions (%d):", len(resF.Actions))
+	for _, a := range resF.Actions {
+		t.Logf("  Action F: %v | %s -> %s", a.Type, a.SourcePath, a.TargetPath)
+	}
+	// Case G: showDir2 scanned via ScanPaths("", showDir2)
+	resG, err := scanner.ScanPaths("", showDir2)
+	if err != nil {
+		t.Fatalf("ScanPaths G failed: %v", err)
+	}
+	t.Logf("Case G Actions (%d):", len(resG.Actions))
+	for _, a := range resG.Actions {
+		t.Logf("  Action G: %v | %s -> %s", a.Type, a.SourcePath, a.TargetPath)
+	}
+	// Case H: Files named with " - 01" or "Part 1"
+	showDir3 := filepath.Join(serienDir, "Monster - The Lizzie Borden Story (2026) 3")
+	_ = os.MkdirAll(showDir3, 0755)
+	epH1 := filepath.Join(showDir3, "Monster - The Lizzie Borden Story - 01.mkv")
+	epH2 := filepath.Join(showDir3, "Monster - The Lizzie Borden Story - Part 2.mkv")
+	_ = os.WriteFile(epH1, []byte("h1"), 0644)
+	_ = os.WriteFile(epH2, []byte("h2"), 0644)
+	resH, err := scanner.Scan(showDir3)
+	if err != nil {
+		t.Fatalf("Scan H failed: %v", err)
+	}
+	t.Logf("Case H Actions (%d):", len(resH.Actions))
+	for _, a := range resH.Actions {
+		t.Logf("  Action H: %v | %s -> %s", a.Type, a.SourcePath, a.TargetPath)
+	}
+}
 
 func TestGenericFolderNotRenamed(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "smrt_test_generic_folder_*")
@@ -861,4 +951,145 @@ func TestSubtitleDeduplicationEndToEnd(t *testing.T) {
 		t.Errorf("Collision sub %s should NOT exist because duplicate was removed", collisionSub)
 	}
 }
+
+func TestScanPathsMoviesAndShows(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "smrt_scanpaths_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	moviesDir := filepath.Join(tempDir, "Movies")
+	showsDir := filepath.Join(tempDir, "Shows")
+	_ = os.MkdirAll(moviesDir, 0755)
+	_ = os.MkdirAll(showsDir, 0755)
+
+	// Create movie in moviesDir
+	m1 := filepath.Join(moviesDir, "Inception.2010.1080p.mkv")
+	_ = os.WriteFile(m1, []byte("movie"), 0644)
+
+	// Create series episode in showsDir
+	s1 := filepath.Join(showsDir, "Breaking.Bad.S01E01.720p.mkv")
+	_ = os.WriteFile(s1, []byte("show"), 0644)
+
+	scanner := NewScanner(SeparatorSpace)
+	res, err := scanner.ScanPaths(moviesDir, showsDir)
+	if err != nil {
+		t.Fatalf("ScanPaths failed: %v", err)
+	}
+
+	if res.TotalMovies != 1 {
+		t.Errorf("Expected 1 movie, got %d", res.TotalMovies)
+	}
+	if res.TotalShows != 1 {
+		t.Errorf("Expected 1 show, got %d", res.TotalShows)
+	}
+	if len(res.Actions) == 0 {
+		t.Fatalf("Expected actions for both movie and show")
+	}
+
+	executor := NewExecutor()
+	execRes := executor.Execute(res.Actions)
+	if execRes.ErrorCount > 0 {
+		t.Fatalf("Execution had errors: %v", execRes.Errors)
+	}
+
+	expectedMovie := filepath.Join(moviesDir, "Inception (2010)", "Inception (2010).mkv")
+	expectedShow := filepath.Join(showsDir, "Breaking Bad", "Breaking Bad - S01E01.mkv")
+
+	if _, err := os.Stat(expectedMovie); os.IsNotExist(err) {
+		t.Errorf("Expected movie %s does not exist", expectedMovie)
+	}
+	if _, err := os.Stat(expectedShow); os.IsNotExist(err) {
+		t.Errorf("Expected show %s does not exist", expectedShow)
+	}
+}
+
+func TestSeriesPathNeverTreatsEpisodeAsMovie(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "smrt_series_protect_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	showsDir := filepath.Join(tempDir, "MySeries")
+	_ = os.MkdirAll(showsDir, 0755)
+
+	// Single episode with a year in title: Doctor Who (2005) - S01E01
+	// In the past, single episodes with a year were often mistaken for movies!
+	epFile := filepath.Join(showsDir, "Doctor.Who.2005.S01E01.720p.mkv")
+	_ = os.WriteFile(epFile, []byte("data"), 0644)
+
+	scanner := NewScanner(SeparatorSpace)
+	res, err := scanner.ScanPaths("", showsDir)
+	if err != nil {
+		t.Fatalf("ScanPaths failed: %v", err)
+	}
+
+	if res.TotalMovies != 0 {
+		t.Errorf("Series path should have 0 movies, got %d", res.TotalMovies)
+	}
+	if res.TotalShows != 1 {
+		t.Errorf("Expected 1 show, got %d", res.TotalShows)
+	}
+
+	// Verify target path does NOT contain movie format or single-episode movie folder
+	for _, act := range res.Actions {
+		if act.Type == ActionCreateFolder && strings.Contains(act.TargetPath, "S01E01") {
+			t.Errorf("Episode was treated as movie folder: %s", act.TargetPath)
+		}
+	}
+
+	executor := NewExecutor()
+	execRes := executor.Execute(res.Actions)
+	if execRes.ErrorCount > 0 {
+		t.Fatalf("Execution had errors: %v", execRes.Errors)
+	}
+
+	expectedShow := filepath.Join(showsDir, "Doctor Who (2005)", "Doctor Who - S01E01.mkv")
+	if _, err := os.Stat(expectedShow); os.IsNotExist(err) {
+		t.Errorf("Expected show file %s does not exist", expectedShow)
+	}
+}
+
+func TestMoviePathSkipsSeriesEpisodesWithWarning(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "smrt_movie_warn_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	moviesDir := filepath.Join(tempDir, "Movies")
+	_ = os.MkdirAll(moviesDir, 0755)
+
+	// A valid movie
+	m1 := filepath.Join(moviesDir, "Gladiator.2000.mkv")
+	_ = os.WriteFile(m1, []byte("movie"), 0644)
+
+	// An accidental TV episode in the movies directory
+	s1 := filepath.Join(moviesDir, "Dark.S01E01.mkv")
+	_ = os.WriteFile(s1, []byte("tv episode"), 0644)
+
+	scanner := NewScanner(SeparatorSpace)
+	res, err := scanner.ScanPaths(moviesDir, "")
+	if err != nil {
+		t.Fatalf("ScanPaths failed: %v", err)
+	}
+
+	// Should process the movie, but skip the TV episode and add a warning
+	if res.TotalMovies != 1 {
+		t.Errorf("Expected 1 movie processed, got %d", res.TotalMovies)
+	}
+	if len(res.Warnings) == 0 {
+		t.Errorf("Expected warning for TV episode in movie folder, got none")
+	}
+
+	// Ensure no action treats Dark.S01E01 as a movie
+	for _, act := range res.Actions {
+		if strings.Contains(act.SourcePath, "Dark.S01E01") {
+			t.Errorf("Accidental TV episode in movie folder should not have movie action: %+v", act)
+		}
+	}
+}
+
 

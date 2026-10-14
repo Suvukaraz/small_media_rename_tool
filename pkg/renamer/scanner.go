@@ -43,6 +43,73 @@ func ExpandPath(path string) string {
 	return filepath.Clean(path)
 }
 
+// ScanPaths scans one or both directories (moviePath and showPath).
+// If both paths are provided, both will be scanned and their actions merged.
+// TV episodes in the showPath will strictly be handled as TV series.
+func (s *Scanner) ScanPaths(moviePath, showPath string) (*ScanResult, error) {
+	moviePath = strings.TrimSpace(moviePath)
+	showPath = strings.TrimSpace(showPath)
+
+	if moviePath == "" && showPath == "" {
+		return nil, fmt.Errorf("bitte mindestens einen Ordnerpfad (Filme oder Serien) angeben")
+	}
+
+	res := &ScanResult{
+		Separator: s.Separator,
+		UseSpaces: s.Separator == SeparatorSpace,
+		Actions:   []Action{},
+		Warnings:  []string{},
+	}
+
+	if moviePath != "" {
+		cleanMovie := ExpandPath(moviePath)
+		absMovie, err := filepath.Abs(cleanMovie)
+		if err != nil {
+			return nil, fmt.Errorf("ungültiger Film-Pfad: %w", err)
+		}
+		info, err := os.Stat(absMovie)
+		if err != nil {
+			return nil, fmt.Errorf("Film-Pfad nicht gefunden: %w", err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("angegebener Film-Pfad ist kein Ordner")
+		}
+		res.MoviePath = absMovie
+		if err := s.scanMovieRoot(res, absMovie); err != nil {
+			return nil, err
+		}
+	}
+
+	if showPath != "" {
+		cleanShow := ExpandPath(showPath)
+		absShow, err := filepath.Abs(cleanShow)
+		if err != nil {
+			return nil, fmt.Errorf("ungültiger Serien-Pfad: %w", err)
+		}
+		info, err := os.Stat(absShow)
+		if err != nil {
+			return nil, fmt.Errorf("Serien-Pfad nicht gefunden: %w", err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("angegebener Serien-Pfad ist kein Ordner")
+		}
+		res.ShowPath = absShow
+		if err := s.scanShowRoot(res, absShow); err != nil {
+			return nil, err
+		}
+	}
+
+	if res.MoviePath != "" && res.ShowPath != "" {
+		res.RootPath = res.MoviePath + " | " + res.ShowPath
+	} else if res.MoviePath != "" {
+		res.RootPath = res.MoviePath
+	} else {
+		res.RootPath = res.ShowPath
+	}
+
+	return res, nil
+}
+
 // Scan examines the given directory and generates a planned list of actions.
 func (s *Scanner) Scan(inputPath string) (*ScanResult, error) {
 	cleanPath := ExpandPath(inputPath)
@@ -96,14 +163,28 @@ func (s *Scanner) Scan(inputPath string) (*ScanResult, error) {
 	}
 
 	// Check if the root directory itself is a single Show or Movie folder
-	if len(videoFiles) > 0 {
-		isSingleItemRoot := s.checkIfFolderIsSingleItem(absPath, videoFiles)
-		if isSingleItemRoot {
+	if !isGenericFolder(filepath.Base(absPath)) {
+		if len(videoFiles) > 0 && s.checkIfFolderIsSingleItem(absPath, videoFiles) {
 			err := s.planActionsForFolder(res, absPath, true)
 			if err != nil {
 				return nil, err
 			}
 			return res, nil
+		}
+		// If videoFiles in root is 0, check if subfolders contain season episodes for a single show
+		if len(videoFiles) == 0 && len(subDirs) > 0 {
+			vFiles, sFiles, err := s.collectFolderMedia(absPath)
+			if err == nil && len(vFiles) > 0 {
+				epCount := 0
+				for _, vf := range vFiles {
+					if _, _, _, matched := ExtractEpisodeInfoFromPath(vf); matched {
+						epCount++
+					}
+				}
+				if epCount > 0 && epCount >= len(vFiles)/2 {
+					return res, s.planTVShowDirect(res, absPath, filepath.Base(absPath), true, vFiles, sFiles)
+				}
+			}
 		}
 	}
 
@@ -123,13 +204,171 @@ func (s *Scanner) Scan(inputPath string) (*ScanResult, error) {
 	return res, nil
 }
 
+// scanMovieRoot processes a directory designated exclusively for movies.
+func (s *Scanner) scanMovieRoot(res *ScanResult, absPath string) error {
+	entries, err := os.ReadDir(absPath)
+	if err != nil {
+		return fmt.Errorf("konnte Film-Ordner nicht lesen: %w", err)
+	}
+
+	var subDirs []string
+	var videoFiles []string
+	var subtitleFiles []string
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		full := filepath.Join(absPath, name)
+		if entry.IsDir() {
+			base := strings.ToLower(name)
+			if base == "subs" || base == "subtitles" || base == "untertitel" {
+				continue
+			}
+			subDirs = append(subDirs, full)
+		} else {
+			if IsMediaFile(name) {
+				videoFiles = append(videoFiles, full)
+			} else if IsSubtitleFile(name) {
+				subtitleFiles = append(subtitleFiles, full)
+			}
+		}
+	}
+
+	// Check if absPath itself is a single dedicated movie folder
+	if len(videoFiles) > 0 && len(videoFiles) <= 2 && len(subDirs) == 0 && !isGenericFolder(filepath.Base(absPath)) {
+		epCount := 0
+		for _, vf := range videoFiles {
+			if _, _, _, matched := ExtractEpisodeInfoFromPath(vf); matched {
+				epCount++
+			}
+		}
+		if epCount == 0 {
+			allSubs, err := s.collectSubs(absPath)
+			if err == nil {
+				subtitleFiles = allSubs
+			}
+			return s.planMovie(res, absPath, filepath.Base(absPath), true, videoFiles, subtitleFiles)
+		}
+	}
+
+	// Process subdirectories as movie folders
+	for _, subDir := range subDirs {
+		vFiles, sFiles, err := s.collectFolderMedia(subDir)
+		if err != nil {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("%s: %v", filepath.Base(subDir), err))
+			continue
+		}
+		if len(vFiles) == 0 {
+			continue
+		}
+		// Guard: Check if folder contains TV episodes
+		hasTV := false
+		for _, vf := range vFiles {
+			if _, _, _, matched := ExtractEpisodeInfoFromPath(vf); matched {
+				hasTV = true
+				break
+			}
+		}
+		if hasTV {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("Film-Pfad: '%s' enthält Serien-Episoden und wird im Film-Pfad übersprungen (bitte im Serien-Pfad angeben).", filepath.Base(subDir)))
+			continue
+		}
+		if err := s.planMovie(res, subDir, filepath.Base(subDir), false, vFiles, sFiles); err != nil {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("%s: %v", filepath.Base(subDir), err))
+		}
+	}
+
+	// Process loose files in movie root
+	if len(videoFiles) > 0 || len(subtitleFiles) > 0 {
+		var validMovies []string
+		for _, vf := range videoFiles {
+			if _, _, _, matched := ExtractEpisodeInfoFromPath(vf); matched {
+				res.Warnings = append(res.Warnings, fmt.Sprintf("Film-Pfad: '%s' ist eine Serien-Episode und wird im Film-Pfad übersprungen (bitte im Serien-Pfad angeben).", filepath.Base(vf)))
+				continue
+			}
+			validMovies = append(validMovies, vf)
+		}
+		if len(validMovies) > 0 || len(subtitleFiles) > 0 {
+			s.planLooseMovieFiles(res, absPath, validMovies, subtitleFiles)
+		}
+	}
+
+	return nil
+}
+
+// scanShowRoot processes a directory designated exclusively for TV shows.
+// In this mode, TV episodes are NEVER treated as movies.
+func (s *Scanner) scanShowRoot(res *ScanResult, absPath string) error {
+	entries, err := os.ReadDir(absPath)
+	if err != nil {
+		return fmt.Errorf("konnte Serien-Ordner nicht lesen: %w", err)
+	}
+
+	var subDirs []string
+	var videoFiles []string
+	var subtitleFiles []string
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		full := filepath.Join(absPath, name)
+		if entry.IsDir() {
+			base := strings.ToLower(name)
+			if base == "subs" || base == "subtitles" || base == "untertitel" {
+				continue
+			}
+			subDirs = append(subDirs, full)
+		} else {
+			if IsMediaFile(name) {
+				videoFiles = append(videoFiles, full)
+			} else if IsSubtitleFile(name) {
+				subtitleFiles = append(subtitleFiles, full)
+			}
+		}
+	}
+
+	// Check if absPath itself is a single dedicated TV Show folder
+	if !isGenericFolder(filepath.Base(absPath)) {
+		vFiles, sFiles, err := s.collectFolderMedia(absPath)
+		if err == nil && len(vFiles) > 0 {
+			return s.planTVShowDirect(res, absPath, filepath.Base(absPath), true, vFiles, sFiles)
+		}
+	}
+
+	// Process each subdirectory in show root as a TV Show
+	for _, subDir := range subDirs {
+		vFiles, sFiles, err := s.collectFolderMedia(subDir)
+		if err != nil {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("%s: %v", filepath.Base(subDir), err))
+			continue
+		}
+		if len(vFiles) == 0 {
+			continue
+		}
+		if err := s.planTVShowDirect(res, subDir, filepath.Base(subDir), false, vFiles, sFiles); err != nil {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("%s: %v", filepath.Base(subDir), err))
+		}
+	}
+
+	// Process loose video/subtitle files in show root
+	if len(videoFiles) > 0 || len(subtitleFiles) > 0 {
+		s.planLooseSeriesFiles(res, absPath, videoFiles, subtitleFiles)
+	}
+
+	return nil
+}
+
 // checkIfFolderIsSingleItem checks if folder itself represents a single movie or TV show release.
 func (s *Scanner) checkIfFolderIsSingleItem(folderPath string, videoFiles []string) bool {
 	// If all video files are TV episodes belonging to one show
 	var seasons []int
 	epCount := 0
 	for _, vf := range videoFiles {
-		sNum, _, _, matched := ExtractEpisodeInfo(filepath.Base(vf))
+		sNum, _, _, matched := ExtractEpisodeInfoFromPath(vf)
 		if matched {
 			epCount++
 			seasons = append(seasons, sNum)
@@ -141,7 +380,8 @@ func (s *Scanner) checkIfFolderIsSingleItem(folderPath string, videoFiles []stri
 	}
 
 	// If there's 1 or 2 video files (e.g. CD1/CD2 or main movie) and matches movie year pattern
-	if len(videoFiles) <= 2 {
+	// Crucial: Must NOT contain any TV episodes!
+	if len(videoFiles) <= 2 && epCount == 0 {
 		folderName := filepath.Base(folderPath)
 		if !isGenericFolder(folderName) {
 			_, year := ExtractMovieYearAndTitle(folderName)
@@ -162,35 +402,7 @@ func (s *Scanner) checkIfFolderIsSingleItem(folderPath string, videoFiles []stri
 func (s *Scanner) planActionsForFolder(res *ScanResult, folderPath string, isRoot bool) error {
 	folderName := filepath.Base(folderPath)
 
-	// Collect all video and subtitle files inside folderPath (including season subdirs and Subs/ folders)
-	var videoFiles []string
-	var subtitleFiles []string
-
-	err := filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if info.IsDir() {
-			if path != folderPath {
-				base := strings.ToLower(info.Name())
-				isSeasonDir := strings.HasPrefix(base, "season") || strings.HasPrefix(base, "staffel") || (len(base) >= 2 && base[0] == 's' && isDigit(base[1]))
-				isSubsDir := base == "subs" || base == "subtitles" || base == "untertitel"
-				if !isSeasonDir && !isSubsDir {
-					return filepath.SkipDir
-				}
-			}
-			return nil
-		}
-		if strings.HasPrefix(info.Name(), ".") {
-			return nil
-		}
-		if IsMediaFile(info.Name()) {
-			videoFiles = append(videoFiles, path)
-		} else if IsSubtitleFile(info.Name()) {
-			subtitleFiles = append(subtitleFiles, path)
-		}
-		return nil
-	})
+	videoFiles, subtitleFiles, err := s.collectFolderMedia(folderPath)
 	if err != nil {
 		return err
 	}
@@ -205,7 +417,7 @@ func (s *Scanner) planActionsForFolder(res *ScanResult, folderPath string, isRoo
 
 	for _, vf := range videoFiles {
 		filename := filepath.Base(vf)
-		season, ep, ep2, matched := ExtractEpisodeInfo(filename)
+		season, ep, ep2, matched := ExtractEpisodeInfoFromPath(vf)
 		if matched {
 			seasonsSet[season] = true
 			episodes = append(episodes, &EpisodeFile{
@@ -237,18 +449,7 @@ func (s *Scanner) planTVShow(res *ScanResult, folderPath, folderName string, isR
 
 	var candidateFileTitle string
 	if len(episodes) > 0 {
-		epName := episodes[0].Filename
-		loc := tvPatternSxxExx.FindStringIndex(epName)
-		if loc == nil {
-			loc = tvPatternNxNN.FindStringIndex(epName)
-		}
-		if loc != nil && loc[0] > 0 {
-			prefix := epName[:loc[0]]
-			if hyphenIdx := strings.Index(prefix, "-"); hyphenIdx > 0 {
-				prefix = prefix[:hyphenIdx]
-			}
-			candidateFileTitle = CleanTitle(prefix)
-		}
+		candidateFileTitle = ExtractShowTitleFromFilename(episodes[0].Filename)
 	}
 
 	showTitle := cleanFolderName
@@ -265,7 +466,7 @@ func (s *Scanner) planTVShow(res *ScanResult, folderPath, folderName string, isR
 	parentDir := filepath.Dir(folderPath)
 	targetShowFolderPath := filepath.Join(parentDir, formattedShowTitle)
 
-	if folderName != formattedShowTitle {
+	if (!isRoot || !isGenericFolder(folderName)) && folderName != formattedShowTitle {
 		res.Actions = append(res.Actions, Action{
 			Type:        ActionRenameFolder,
 			SourcePath:  folderPath,
@@ -293,6 +494,7 @@ func (s *Scanner) planTVShow(res *ScanResult, folderPath, folderName string, isR
 		epStr         string
 	}
 	epTargets := make(map[*EpisodeFile]episodeTargetInfo)
+	usedEpPaths := make(map[string]int)
 
 	for _, ep := range episodes {
 		seasonStr := fmt.Sprintf("S%02d", ep.Season)
@@ -303,7 +505,8 @@ func (s *Scanner) planTVShow(res *ScanResult, folderPath, folderName string, isR
 			epStr = fmt.Sprintf("S%02dE%02d", ep.Season, ep.Episode)
 		}
 
-		rawBaseName := fmt.Sprintf("%s - %s", showTitle, epStr)
+		episodeTitle := StripYearFromTitle(showTitle)
+		rawBaseName := fmt.Sprintf("%s - %s", episodeTitle, epStr)
 		newBaseName := FormatSeparator(rawBaseName, s.Separator)
 
 		var targetDirPath string
@@ -317,6 +520,19 @@ func (s *Scanner) planTVShow(res *ScanResult, folderPath, folderName string, isR
 		}
 
 		finalFilePath := filepath.Join(targetDirPath, newBaseName+ep.Extension)
+		if count, exists := usedEpPaths[finalFilePath]; exists {
+			usedEpPaths[finalFilePath] = count + 1
+			newBaseName = fmt.Sprintf("%s (%d)", newBaseName, count+1)
+			finalFilePath = filepath.Join(targetDirPath, newBaseName+ep.Extension)
+			if hasMultipleSeasons {
+				relTarget = filepath.Join(formattedShowTitle, seasonStr, newBaseName+ep.Extension)
+			} else {
+				relTarget = filepath.Join(formattedShowTitle, newBaseName+ep.Extension)
+			}
+		} else {
+			usedEpPaths[finalFilePath] = 1
+		}
+
 		relSource, _ := filepath.Rel(parentDir, ep.OriginalPath)
 
 		actionType := ActionRenameFile
@@ -324,14 +540,16 @@ func (s *Scanner) planTVShow(res *ScanResult, folderPath, folderName string, isR
 			actionType = ActionMoveFile
 		}
 
-		res.Actions = append(res.Actions, Action{
-			Type:        actionType,
-			SourcePath:  ep.OriginalPath,
-			TargetPath:  finalFilePath,
-			DisplayOld:  relSource,
-			DisplayNew:  relTarget,
-			Description: fmt.Sprintf("Episode %s", epStr),
-		})
+		if ep.OriginalPath != finalFilePath {
+			res.Actions = append(res.Actions, Action{
+				Type:        actionType,
+				SourcePath:  ep.OriginalPath,
+				TargetPath:  finalFilePath,
+				DisplayOld:  relSource,
+				DisplayNew:  relTarget,
+				Description: fmt.Sprintf("Episode %s", epStr),
+			})
+		}
 
 		epTargets[ep] = episodeTargetInfo{
 			targetDirPath: targetDirPath,
@@ -404,14 +622,16 @@ func (s *Scanner) planTVShow(res *ScanResult, folderPath, folderName string, isR
 
 			actType, desc := subtitleActionTypeAndDesc(subInfo)
 
-			res.Actions = append(res.Actions, Action{
-				Type:        actType,
-				SourcePath:  subInfo.OriginalPath,
-				TargetPath:  targetSubPath,
-				DisplayOld:  relSubSource,
-				DisplayNew:  relSubTarget,
-				Description: desc,
-			})
+			if subInfo.OriginalPath != targetSubPath {
+				res.Actions = append(res.Actions, Action{
+					Type:        actType,
+					SourcePath:  subInfo.OriginalPath,
+					TargetPath:  targetSubPath,
+					DisplayOld:  relSubSource,
+					DisplayNew:  relSubTarget,
+					Description: desc,
+				})
+			}
 		}
 	}
 
@@ -421,45 +641,57 @@ func (s *Scanner) planTVShow(res *ScanResult, folderPath, folderName string, isR
 func (s *Scanner) planMovie(res *ScanResult, folderPath, folderName string, isRoot bool, videoFiles, subtitles []string) error {
 	parentDir := filepath.Dir(folderPath)
 
-	// If there is exactly 1 movie and folderPath is a dedicated movie folder (not generic)
-	isDedicatedFolder := len(videoFiles) == 1 && !isGenericFolder(folderName)
-
-	if isDedicatedFolder {
-		// Single movie in its own folder: rename folder and file
-		vf := videoFiles[0]
-		fileName := filepath.Base(vf)
-		ext := filepath.Ext(vf)
-		baseName := strings.TrimSuffix(fileName, ext)
-
-		title, year := ExtractMovieYearAndTitle(baseName)
-		if year == 0 {
-			fTitle, fYear := ExtractMovieYearAndTitle(folderName)
-			if fYear > 0 {
-				year = fYear
-				if title == "" {
-					title = fTitle
-				}
+	// A dedicated movie folder is a non-generic folder holding a single movie release
+	isDedicatedFolder := !isGenericFolder(folderName)
+	if isRoot {
+		_, fYear := ExtractMovieYearAndTitle(folderName)
+		if fYear == 0 && len(videoFiles) > 1 {
+			t1, _ := ExtractMovieYearAndTitle(strings.TrimSuffix(filepath.Base(videoFiles[0]), filepath.Ext(videoFiles[0])))
+			t2, _ := ExtractMovieYearAndTitle(strings.TrimSuffix(filepath.Base(videoFiles[1]), filepath.Ext(videoFiles[1])))
+			if t1 != t2 {
+				isDedicatedFolder = false
 			}
 		}
-		if title == "" {
-			title = CleanTitle(StripSceneTags(baseName))
+	}
+
+	if isDedicatedFolder {
+		// Determine movie title and year from folder name and video files
+		var cleanMovieName string
+		fTitle, fYear := ExtractMovieYearAndTitle(folderName)
+		var bestTitle string
+		bestYear := fYear
+
+		if len(videoFiles) > 0 {
+			vBase := strings.TrimSuffix(filepath.Base(videoFiles[0]), filepath.Ext(videoFiles[0]))
+			vTitle, vYear := ExtractMovieYearAndTitle(vBase)
+			if vYear > 0 {
+				bestYear = vYear
+			}
+			if vTitle != "" {
+				bestTitle = vTitle
+			}
 		}
-		if title == "" {
-			title = "Movie"
+		if bestTitle == "" {
+			bestTitle = fTitle
+		}
+		if bestTitle == "" {
+			bestTitle = CleanTitle(StripSceneTags(folderName))
+		}
+		if bestTitle == "" {
+			bestTitle = "Movie"
 		}
 
-		var cleanMovieName string
-		if year > 0 {
-			cleanMovieName = fmt.Sprintf("%s (%d)", title, year)
+		if bestYear > 0 {
+			cleanMovieName = fmt.Sprintf("%s (%d)", bestTitle, bestYear)
 		} else {
-			cleanMovieName = title
+			cleanMovieName = bestTitle
 		}
 
 		formattedMovieName := FormatSeparator(cleanMovieName, s.Separator)
 		targetMovieFolderPath := filepath.Join(parentDir, formattedMovieName)
 
 		res.TotalMovies++
-		res.TotalFiles++
+		res.TotalFiles += len(videoFiles)
 
 		if folderName != formattedMovieName {
 			res.Actions = append(res.Actions, Action{
@@ -472,24 +704,47 @@ func (s *Scanner) planMovie(res *ScanResult, folderPath, folderName string, isRo
 			})
 		}
 
-		newFileName := formattedMovieName + ext
-		finalFilePath := filepath.Join(targetMovieFolderPath, newFileName)
-		relSource, _ := filepath.Rel(parentDir, vf)
-		relTarget := filepath.Join(formattedMovieName, newFileName)
+		usedVideoPaths := make(map[string]int)
+		for _, vf := range videoFiles {
+			fileName := filepath.Base(vf)
+			ext := filepath.Ext(vf)
+			baseName := strings.TrimSuffix(fileName, ext)
 
-		res.Actions = append(res.Actions, Action{
-			Type:        ActionRenameFile,
-			SourcePath:  vf,
-			TargetPath:  finalFilePath,
-			DisplayOld:  relSource,
-			DisplayNew:  relTarget,
-			Description: fmt.Sprintf("Film: %s", cleanMovieName),
-		})
+			newFileName := formattedMovieName + ext
+			if isSample, label := IsSampleOrTrailer(baseName); isSample {
+				newFileName = fmt.Sprintf("%s - %s%s", formattedMovieName, label, ext)
+			} else if partNum := ExtractPartInfo(baseName); partNum > 0 {
+				newFileName = fmt.Sprintf("%s - Part %d%s", formattedMovieName, partNum, ext)
+			}
+
+			finalFilePath := filepath.Join(targetMovieFolderPath, newFileName)
+			if count, exists := usedVideoPaths[finalFilePath]; exists {
+				usedVideoPaths[finalFilePath] = count + 1
+				newFileName = fmt.Sprintf("%s (%d)%s", formattedMovieName, count+1, ext)
+				finalFilePath = filepath.Join(targetMovieFolderPath, newFileName)
+			} else {
+				usedVideoPaths[finalFilePath] = 1
+			}
+
+			relSource, _ := filepath.Rel(parentDir, vf)
+			relTarget := filepath.Join(formattedMovieName, newFileName)
+
+			if vf != finalFilePath {
+				res.Actions = append(res.Actions, Action{
+					Type:        ActionRenameFile,
+					SourcePath:  vf,
+					TargetPath:  finalFilePath,
+					DisplayOld:  relSource,
+					DisplayNew:  relTarget,
+					Description: fmt.Sprintf("Film: %s", cleanMovieName),
+				})
+			}
+		}
 
 		// Filter subtitles: ONLY keep German and English, delete all others, deduplicate
 		validSubs := filterAndDedupSubtitles(res, subtitles, parentDir)
 
-		// Subtitles for this single movie
+		// Subtitles for this movie
 		usedSubPaths := make(map[string]int)
 		for _, subInfo := range validSubs {
 			subSuffix := SubtitleSuffix(subInfo)
@@ -509,24 +764,26 @@ func (s *Scanner) planMovie(res *ScanResult, folderPath, folderName string, isRo
 
 			actType, desc := subtitleActionTypeAndDesc(subInfo)
 
-			res.Actions = append(res.Actions, Action{
-				Type:        actType,
-				SourcePath:  subInfo.OriginalPath,
-				TargetPath:  targetSubPath,
-				DisplayOld:  relSubSource,
-				DisplayNew:  relSubTarget,
-				Description: desc,
-			})
+			if subInfo.OriginalPath != targetSubPath {
+				res.Actions = append(res.Actions, Action{
+					Type:        actType,
+					SourcePath:  subInfo.OriginalPath,
+					TargetPath:  targetSubPath,
+					DisplayOld:  relSubSource,
+					DisplayNew:  relSubTarget,
+					Description: desc,
+				})
+			}
 		}
 
 		return nil
 	}
 
-	// Filter subtitles: ONLY keep German and English, delete all others, deduplicate
+	// Generic container folder (e.g. Downloads or Filme with multiple different movies)
 	validSubs := filterAndDedupSubtitles(res, subtitles, folderPath)
+	usedFolders := make(map[string]bool)
+	usedVideoPaths := make(map[string]int)
 
-	// If there are multiple movies (or loose movies in a container folder):
-	// "wird für jeden film ein ordner erstellt gleich benannt wie der film. in diesen ordner liegt dann der film."
 	for _, vf := range videoFiles {
 		fileName := filepath.Base(vf)
 		ext := filepath.Ext(vf)
@@ -553,29 +810,47 @@ func (s *Scanner) planMovie(res *ScanResult, folderPath, folderName string, isRo
 		res.TotalMovies++
 		res.TotalFiles++
 
-		// Create dedicated folder for this movie
-		res.Actions = append(res.Actions, Action{
-			Type:        ActionCreateFolder,
-			SourcePath:  "",
-			TargetPath:  targetMovieFolderPath,
-			DisplayOld:  "(Neu)",
-			DisplayNew:  formattedMovieName,
-			Description: fmt.Sprintf("Ordner für Film: %s", formattedMovieName),
-		})
+		if !usedFolders[targetMovieFolderPath] {
+			usedFolders[targetMovieFolderPath] = true
+			res.Actions = append(res.Actions, Action{
+				Type:        ActionCreateFolder,
+				SourcePath:  "",
+				TargetPath:  targetMovieFolderPath,
+				DisplayOld:  "(Neu)",
+				DisplayNew:  formattedMovieName,
+				Description: fmt.Sprintf("Ordner für Film: %s", formattedMovieName),
+			})
+		}
 
 		newFileName := formattedMovieName + ext
+		if isSample, label := IsSampleOrTrailer(baseName); isSample {
+			newFileName = fmt.Sprintf("%s - %s%s", formattedMovieName, label, ext)
+		} else if partNum := ExtractPartInfo(baseName); partNum > 0 {
+			newFileName = fmt.Sprintf("%s - Part %d%s", formattedMovieName, partNum, ext)
+		}
+
 		finalFilePath := filepath.Join(targetMovieFolderPath, newFileName)
+		if count, exists := usedVideoPaths[finalFilePath]; exists {
+			usedVideoPaths[finalFilePath] = count + 1
+			newFileName = fmt.Sprintf("%s (%d)%s", formattedMovieName, count+1, ext)
+			finalFilePath = filepath.Join(targetMovieFolderPath, newFileName)
+		} else {
+			usedVideoPaths[finalFilePath] = 1
+		}
+
 		relSource, _ := filepath.Rel(folderPath, vf)
 		relTarget := filepath.Join(formattedMovieName, newFileName)
 
-		res.Actions = append(res.Actions, Action{
-			Type:        ActionMoveFile,
-			SourcePath:  vf,
-			TargetPath:  finalFilePath,
-			DisplayOld:  relSource,
-			DisplayNew:  relTarget,
-			Description: fmt.Sprintf("Film: %s", cleanMovieName),
-		})
+		if vf != finalFilePath {
+			res.Actions = append(res.Actions, Action{
+				Type:        ActionMoveFile,
+				SourcePath:  vf,
+				TargetPath:  finalFilePath,
+				DisplayOld:  relSource,
+				DisplayNew:  relTarget,
+				Description: fmt.Sprintf("Film: %s", cleanMovieName),
+			})
+		}
 
 		// Find matching subtitles for this movie
 		usedSubPaths := make(map[string]int)
@@ -598,14 +873,16 @@ func (s *Scanner) planMovie(res *ScanResult, folderPath, folderName string, isRo
 
 				actType, desc := subtitleActionTypeAndDesc(subInfo)
 
-				res.Actions = append(res.Actions, Action{
-					Type:        actType,
-					SourcePath:  subInfo.OriginalPath,
-					TargetPath:  targetSubPath,
-					DisplayOld:  relSubSource,
-					DisplayNew:  relSubTarget,
-					Description: desc,
-				})
+				if subInfo.OriginalPath != targetSubPath {
+					res.Actions = append(res.Actions, Action{
+						Type:        actType,
+						SourcePath:  subInfo.OriginalPath,
+						TargetPath:  targetSubPath,
+						DisplayOld:  relSubSource,
+						DisplayNew:  relSubTarget,
+						Description: desc,
+					})
+				}
 			}
 		}
 	}
@@ -830,11 +1107,13 @@ func isDigit(b byte) bool {
 func isGenericFolder(name string) bool {
 	lower := strings.ToLower(name)
 	switch lower {
-	case "downloads", "movies", "filme", "series", "serien", "tv", "tv shows", "media", "torrents", "complete", "incoming", "videos":
+	case "downloads", "movies", "filme", "series", "serien", "shows", "tv", "tv shows", "media", "torrents", "complete", "incoming", "videos", "myseries", "mymovies", "myshows":
 		return true
-	default:
-		return false
 	}
+	if strings.HasSuffix(lower, "series") || strings.HasSuffix(lower, "serien") || strings.HasSuffix(lower, "shows") || strings.HasSuffix(lower, "movies") || strings.HasSuffix(lower, "filme") {
+		return true
+	}
+	return false
 }
 
 func subtitleActionTypeAndDesc(subInfo SubtitleInfo) (ActionType, string) {
@@ -887,4 +1166,386 @@ func filterAndDedupSubtitles(res *ScanResult, subtitles []string, relBaseDir str
 
 	return kept
 }
+
+func (s *Scanner) collectFolderMedia(folderPath string) ([]string, []string, error) {
+	var videoFiles []string
+	var subtitleFiles []string
+
+	err := filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			if path != folderPath && strings.HasPrefix(info.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasPrefix(info.Name(), ".") {
+			return nil
+		}
+		if IsMediaFile(info.Name()) {
+			videoFiles = append(videoFiles, path)
+		} else if IsSubtitleFile(info.Name()) {
+			subtitleFiles = append(subtitleFiles, path)
+		}
+		return nil
+	})
+	return videoFiles, subtitleFiles, err
+}
+
+func (s *Scanner) collectSubs(folderPath string) ([]string, error) {
+	var subtitleFiles []string
+	err := filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			if path != folderPath {
+				base := strings.ToLower(info.Name())
+				if base != "subs" && base != "subtitles" && base != "untertitel" {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if strings.HasPrefix(info.Name(), ".") {
+			return nil
+		}
+		if IsSubtitleFile(info.Name()) {
+			subtitleFiles = append(subtitleFiles, path)
+		}
+		return nil
+	})
+	return subtitleFiles, err
+}
+
+func (s *Scanner) planTVShowDirect(res *ScanResult, folderPath, folderName string, isRoot bool, videoFiles, subtitles []string) error {
+	var episodes []*EpisodeFile
+	seasonsSet := make(map[int]bool)
+
+	for _, vf := range videoFiles {
+		filename := filepath.Base(vf)
+		season, ep, ep2, matched := ExtractEpisodeInfoFromPath(vf)
+		if !matched {
+			season = 1
+			ep = len(episodes) + 1
+		}
+		seasonsSet[season] = true
+		episodes = append(episodes, &EpisodeFile{
+			OriginalPath: vf,
+			Filename:     filename,
+			Extension:    filepath.Ext(vf),
+			Season:       season,
+			Episode:      ep,
+			SecondEp:     ep2,
+		})
+	}
+
+	return s.planTVShow(res, folderPath, folderName, isRoot, episodes, subtitles, seasonsSet)
+}
+
+func (s *Scanner) planLooseSeriesFiles(res *ScanResult, rootDir string, videoFiles, subtitleFiles []string) {
+	validSubs := filterAndDedupSubtitles(res, subtitleFiles, rootDir)
+
+	type seriesGroup struct {
+		title    string
+		episodes []*EpisodeFile
+		seasons  map[int]bool
+	}
+	groups := make(map[string]*seriesGroup)
+
+	for _, vf := range videoFiles {
+		filename := filepath.Base(vf)
+		ext := filepath.Ext(vf)
+		season, ep, ep2, matched := ExtractEpisodeInfoFromPath(vf)
+
+		showTitle := ExtractShowTitleFromFilename(filename)
+		if showTitle == "" {
+			showTitle = "TV Show"
+		}
+
+		grp, exists := groups[showTitle]
+		if !exists {
+			grp = &seriesGroup{
+				title:   showTitle,
+				seasons: make(map[int]bool),
+			}
+			groups[showTitle] = grp
+		}
+
+		if !matched {
+			season = 1
+			ep = len(grp.episodes) + 1
+		}
+
+		grp.seasons[season] = true
+		grp.episodes = append(grp.episodes, &EpisodeFile{
+			OriginalPath: vf,
+			Filename:     filename,
+			Extension:    ext,
+			Season:       season,
+			Episode:      ep,
+			SecondEp:     ep2,
+		})
+	}
+
+	for _, grp := range groups {
+		res.TotalShows++
+		res.TotalFiles += len(grp.episodes)
+
+		formattedShowTitle := FormatSeparator(grp.title, s.Separator)
+		targetShowFolderPath := filepath.Join(rootDir, formattedShowTitle)
+
+		// Create dedicated folder for show if needed
+		folderAlreadyPlanned := false
+		for _, a := range res.Actions {
+			if a.Type == ActionCreateFolder && a.TargetPath == targetShowFolderPath {
+				folderAlreadyPlanned = true
+				break
+			}
+		}
+		if !folderAlreadyPlanned {
+			res.Actions = append(res.Actions, Action{
+				Type:        ActionCreateFolder,
+				SourcePath:  "",
+				TargetPath:  targetShowFolderPath,
+				DisplayOld:  "(Neu)",
+				DisplayNew:  formattedShowTitle,
+				Description: fmt.Sprintf("Serien-Ordner: %s", formattedShowTitle),
+			})
+		}
+
+		hasMultipleSeasons := len(grp.seasons) > 1
+
+		sort.Slice(grp.episodes, func(i, j int) bool {
+			if grp.episodes[i].Season != grp.episodes[j].Season {
+				return grp.episodes[i].Season < grp.episodes[j].Season
+			}
+			return grp.episodes[i].Episode < grp.episodes[j].Episode
+		})
+
+		type epTarget struct {
+			targetDir string
+			baseName  string
+			seasonStr string
+		}
+		targets := make(map[*EpisodeFile]epTarget)
+		usedEpPaths := make(map[string]int)
+
+		for _, ep := range grp.episodes {
+			seasonStr := fmt.Sprintf("S%02d", ep.Season)
+			var epStr string
+			if ep.SecondEp > 0 {
+				epStr = fmt.Sprintf("S%02dE%02d-E%02d", ep.Season, ep.Episode, ep.SecondEp)
+			} else {
+				epStr = fmt.Sprintf("S%02dE%02d", ep.Season, ep.Episode)
+			}
+
+			epTitle := StripYearFromTitle(grp.title)
+			rawBase := fmt.Sprintf("%s - %s", epTitle, epStr)
+			newBase := FormatSeparator(rawBase, s.Separator)
+			newFileName := newBase + ep.Extension
+
+			var targetDir string
+			var relTarget string
+			if hasMultipleSeasons {
+				targetDir = filepath.Join(targetShowFolderPath, seasonStr)
+				relTarget = filepath.Join(formattedShowTitle, seasonStr, newFileName)
+			} else {
+				targetDir = targetShowFolderPath
+				relTarget = filepath.Join(formattedShowTitle, newFileName)
+			}
+
+			finalFilePath := filepath.Join(targetDir, newFileName)
+			if count, exists := usedEpPaths[finalFilePath]; exists {
+				usedEpPaths[finalFilePath] = count + 1
+				newBase = fmt.Sprintf("%s (%d)", newBase, count+1)
+				newFileName = newBase + ep.Extension
+				finalFilePath = filepath.Join(targetDir, newFileName)
+				if hasMultipleSeasons {
+					relTarget = filepath.Join(formattedShowTitle, seasonStr, newFileName)
+				} else {
+					relTarget = filepath.Join(formattedShowTitle, newFileName)
+				}
+			} else {
+				usedEpPaths[finalFilePath] = 1
+			}
+
+			if ep.OriginalPath != finalFilePath {
+				res.Actions = append(res.Actions, Action{
+					Type:        ActionMoveFile,
+					SourcePath:  ep.OriginalPath,
+					TargetPath:  finalFilePath,
+					DisplayOld:  ep.Filename,
+					DisplayNew:  relTarget,
+					Description: fmt.Sprintf("Serie: %s %s", grp.title, epStr),
+				})
+			}
+
+			targets[ep] = epTarget{
+				targetDir: targetDir,
+				baseName:  newBase,
+				seasonStr: seasonStr,
+			}
+		}
+
+		// Match subtitles for this group
+		usedSubPaths := make(map[string]int)
+		for _, subInfo := range validSubs {
+			var matchedEp *EpisodeFile
+			if subInfo.HasTVEpisode {
+				for _, ep := range grp.episodes {
+					if ep.Season == subInfo.Season && ep.Episode == subInfo.Episode {
+						matchedEp = ep
+						break
+					}
+				}
+			}
+			if matchedEp == nil && len(grp.episodes) == 1 {
+				subBase := strings.ToLower(subInfo.Filename)
+				if strings.Contains(subBase, strings.ToLower(grp.title)) {
+					matchedEp = grp.episodes[0]
+				}
+			}
+
+			if matchedEp != nil {
+				info := targets[matchedEp]
+				subSuffix := SubtitleSuffix(subInfo)
+				newSubName := info.baseName + subSuffix + ".srt"
+
+				targetSubPath := filepath.Join(info.targetDir, newSubName)
+				if count, exists := usedSubPaths[targetSubPath]; exists {
+					usedSubPaths[targetSubPath] = count + 1
+					newSubName = fmt.Sprintf("%s%s.%d.srt", info.baseName, subSuffix, count+1)
+					targetSubPath = filepath.Join(info.targetDir, newSubName)
+				} else {
+					usedSubPaths[targetSubPath] = 1
+				}
+
+				var relSubTarget string
+				if hasMultipleSeasons {
+					relSubTarget = filepath.Join(formattedShowTitle, info.seasonStr, newSubName)
+				} else {
+					relSubTarget = filepath.Join(formattedShowTitle, newSubName)
+				}
+
+				actType, desc := subtitleActionTypeAndDesc(subInfo)
+				if subInfo.OriginalPath != targetSubPath {
+					res.Actions = append(res.Actions, Action{
+						Type:        actType,
+						SourcePath:  subInfo.OriginalPath,
+						TargetPath:  targetSubPath,
+						DisplayOld:  subInfo.Filename,
+						DisplayNew:  relSubTarget,
+						Description: desc,
+					})
+				}
+			}
+		}
+	}
+}
+
+func (s *Scanner) planLooseMovieFiles(res *ScanResult, rootDir string, videoFiles, subtitleFiles []string) {
+	validSubs := filterAndDedupSubtitles(res, subtitleFiles, rootDir)
+	usedFolders := make(map[string]bool)
+	usedVideoPaths := make(map[string]int)
+
+	for _, vf := range videoFiles {
+		filename := filepath.Base(vf)
+		ext := filepath.Ext(vf)
+		baseName := strings.TrimSuffix(filename, ext)
+
+		res.TotalMovies++
+		res.TotalFiles++
+
+		title, year := ExtractMovieYearAndTitle(baseName)
+		if title == "" {
+			title = CleanTitle(StripSceneTags(baseName))
+		}
+		if title == "" {
+			title = "Movie"
+		}
+
+		var cleanName string
+		if year > 0 {
+			cleanName = fmt.Sprintf("%s (%d)", title, year)
+		} else {
+			cleanName = title
+		}
+
+		formattedName := FormatSeparator(cleanName, s.Separator)
+		targetMovieFolderPath := filepath.Join(rootDir, formattedName)
+
+		if !usedFolders[targetMovieFolderPath] {
+			usedFolders[targetMovieFolderPath] = true
+			res.Actions = append(res.Actions, Action{
+				Type:        ActionCreateFolder,
+				SourcePath:  "",
+				TargetPath:  targetMovieFolderPath,
+				DisplayOld:  "(Neu)",
+				DisplayNew:  formattedName,
+				Description: fmt.Sprintf("Ordner für Film: %s", formattedName),
+			})
+		}
+
+		newFileName := formattedName + ext
+		if isSample, label := IsSampleOrTrailer(baseName); isSample {
+			newFileName = fmt.Sprintf("%s - %s%s", formattedName, label, ext)
+		} else if partNum := ExtractPartInfo(baseName); partNum > 0 {
+			newFileName = fmt.Sprintf("%s - Part %d%s", formattedName, partNum, ext)
+		}
+
+		finalFilePath := filepath.Join(targetMovieFolderPath, newFileName)
+		if count, exists := usedVideoPaths[finalFilePath]; exists {
+			usedVideoPaths[finalFilePath] = count + 1
+			newFileName = fmt.Sprintf("%s (%d)%s", formattedName, count+1, ext)
+			finalFilePath = filepath.Join(targetMovieFolderPath, newFileName)
+		} else {
+			usedVideoPaths[finalFilePath] = 1
+		}
+
+		if vf != finalFilePath {
+			res.Actions = append(res.Actions, Action{
+				Type:        ActionMoveFile,
+				SourcePath:  vf,
+				TargetPath:  finalFilePath,
+				DisplayOld:  filename,
+				DisplayNew:  filepath.Join(formattedName, newFileName),
+				Description: fmt.Sprintf("Film: %s", cleanName),
+			})
+		}
+
+		usedSubPaths := make(map[string]int)
+		for _, subInfo := range validSubs {
+			if matchSubtitleToMovie(subInfo.OriginalPath, baseName, len(videoFiles) == 1) {
+				subSuffix := SubtitleSuffix(subInfo)
+				newSubName := formattedName + subSuffix + ".srt"
+
+				targetSubPath := filepath.Join(targetMovieFolderPath, newSubName)
+				if count, exists := usedSubPaths[targetSubPath]; exists {
+					usedSubPaths[targetSubPath] = count + 1
+					newSubName = fmt.Sprintf("%s%s.%d.srt", formattedName, subSuffix, count+1)
+					targetSubPath = filepath.Join(targetMovieFolderPath, newSubName)
+				} else {
+					usedSubPaths[targetSubPath] = 1
+				}
+
+				actType, desc := subtitleActionTypeAndDesc(subInfo)
+
+				if subInfo.OriginalPath != targetSubPath {
+					res.Actions = append(res.Actions, Action{
+						Type:        actType,
+						SourcePath:  subInfo.OriginalPath,
+						TargetPath:  targetSubPath,
+						DisplayOld:  filepath.Base(subInfo.OriginalPath),
+						DisplayNew:  filepath.Join(formattedName, newSubName),
+						Description: desc,
+					})
+				}
+			}
+		}
+	}
+}
+
 

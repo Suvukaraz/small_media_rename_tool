@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ExecutionResult holds statistics and logs of executed actions.
@@ -61,9 +62,24 @@ func (e *Executor) Execute(actions []Action) ExecutionResult {
 			}
 
 			// Check if target already exists
-			if _, err := os.Stat(act.TargetPath); err == nil {
-				// Target directory already exists! Merge will happen when files move
-				renamedDirs[act.SourcePath] = act.TargetPath
+			if tgtFi, err := os.Stat(act.TargetPath); err == nil {
+				srcFi, errSrc := os.Stat(act.SourcePath)
+				if errSrc == nil && os.SameFile(srcFi, tgtFi) {
+					// Same directory on disk! Case-only rename (e.g. on Android / FAT / exFAT / sdcardfs)
+					tmpDir := act.SourcePath + fmt.Sprintf(".smrt_tmp_%d", time.Now().UnixNano())
+					if err := os.Rename(act.SourcePath, tmpDir); err == nil {
+						if err := os.Rename(tmpDir, act.TargetPath); err == nil {
+							res.SuccessCount++
+							renamedDirs[act.SourcePath] = act.TargetPath
+							continue
+						} else {
+							_ = os.Rename(tmpDir, act.SourcePath)
+						}
+					}
+				}
+				// Target directory already exists as a distinct directory on disk.
+				// Files will be moved/merged into this existing target directory.
+				// Crucial: DO NOT add to renamedDirs because the source directory was NOT renamed on disk!
 				continue
 			}
 
@@ -119,14 +135,30 @@ func (e *Executor) Execute(actions []Action) ExecutionResult {
 			}
 
 			// Check if source exists
-			if _, err := os.Stat(actualSource); err != nil {
+			srcFi, err := os.Stat(actualSource)
+			if err != nil {
 				res.ErrorCount++
 				res.Errors = append(res.Errors, fmt.Sprintf("Quelldatei nicht gefunden %s: %v", act.DisplayOld, err))
 				continue
 			}
 
+			targetSubPath := act.TargetPath
+			if tgtFi, err := os.Stat(targetSubPath); err == nil {
+				if !os.SameFile(srcFi, tgtFi) {
+					ext := filepath.Ext(targetSubPath)
+					base := strings.TrimSuffix(targetSubPath, ext)
+					for i := 2; i <= 999; i++ {
+						candidate := fmt.Sprintf("%s.%d%s", base, i, ext)
+						if _, err := os.Stat(candidate); os.IsNotExist(err) {
+							targetSubPath = candidate
+							break
+						}
+					}
+				}
+			}
+
 			// Convert to SRT format using astisub
-			if err := ConvertSubtitleToSRT(actualSource, act.TargetPath); err != nil {
+			if err := ConvertSubtitleToSRT(actualSource, targetSubPath); err != nil {
 				res.ErrorCount++
 				res.Errors = append(res.Errors, fmt.Sprintf("Untertitel konvertieren fehlgeschlagen %s -> %s: %v", act.DisplayOld, act.DisplayNew, err))
 				continue
@@ -164,25 +196,64 @@ func (e *Executor) Execute(actions []Action) ExecutionResult {
 		}
 
 		// Check if source exists
-		if _, err := os.Stat(actualSource); err != nil {
+		srcFi, err := os.Stat(actualSource)
+		if err != nil {
 			res.ErrorCount++
 			res.Errors = append(res.Errors, fmt.Sprintf("Quelldatei nicht gefunden %s: %v", act.DisplayOld, err))
 			continue
 		}
 
-		// Check if target already exists (prevent silent overwrites)
-		if _, err := os.Stat(act.TargetPath); err == nil {
-			res.ErrorCount++
-			res.Errors = append(res.Errors, fmt.Sprintf("Zieldatei existiert bereits, übersprungen: %s", act.DisplayNew))
-			continue
+		targetPath := act.TargetPath
+
+		// Check if target already exists
+		if tgtFi, err := os.Stat(targetPath); err == nil {
+			if os.SameFile(srcFi, tgtFi) {
+				// Same file on disk! Case-only rename (e.g. on Android / FAT / exFAT / sdcardfs)
+				tmpFile := actualSource + fmt.Sprintf(".smrt_tmp_%d", time.Now().UnixNano())
+				if err := os.Rename(actualSource, tmpFile); err != nil {
+					res.ErrorCount++
+					res.Errors = append(res.Errors, fmt.Sprintf("Datei umbenennen fehlgeschlagen (Tmp) %s: %v", act.DisplayOld, err))
+					continue
+				}
+				if err := os.Rename(tmpFile, targetPath); err != nil {
+					_ = os.Rename(tmpFile, actualSource)
+					res.ErrorCount++
+					res.Errors = append(res.Errors, fmt.Sprintf("Datei umbenennen fehlgeschlagen %s -> %s: %v", act.DisplayOld, act.DisplayNew, err))
+					continue
+				}
+				res.SuccessCount++
+				continue
+			}
+
+			// Target already exists as a DIFFERENT file!
+			// Disambiguate so the file is not skipped and no data is lost!
+			ext := filepath.Ext(targetPath)
+			base := strings.TrimSuffix(targetPath, ext)
+			disambiguated := ""
+			for i := 2; i <= 999; i++ {
+				candidate := fmt.Sprintf("%s (%d)%s", base, i, ext)
+				if _, err := os.Stat(candidate); os.IsNotExist(err) {
+					disambiguated = candidate
+					break
+				}
+			}
+			if disambiguated == "" {
+				res.ErrorCount++
+				res.Errors = append(res.Errors, fmt.Sprintf("Zieldatei existiert bereits, übersprungen: %s", act.DisplayNew))
+				continue
+			}
+			targetPath = disambiguated
 		}
 
 		// Perform rename / move
-		if err := os.Rename(actualSource, act.TargetPath); err != nil {
+		if err := os.Rename(actualSource, targetPath); err != nil {
 			res.ErrorCount++
-			res.Errors = append(res.Errors, fmt.Sprintf("Datei umbenennen/verschieben fehlgeschlagen %s -> %s: %v", act.DisplayOld, act.DisplayNew, err))
+			res.Errors = append(res.Errors, fmt.Sprintf("Datei umbenennen/verschieben fehlgeschlagen %s -> %s: %v", act.DisplayOld, filepath.Base(targetPath), err))
 		} else {
 			res.SuccessCount++
+			if targetPath != act.TargetPath {
+				res.Errors = append(res.Errors, fmt.Sprintf("Zieldatei existierte bereits, umbenannt zu: %s", filepath.Base(targetPath)))
+			}
 		}
 	}
 

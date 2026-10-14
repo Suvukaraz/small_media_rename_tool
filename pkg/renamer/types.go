@@ -67,6 +67,8 @@ type MovieItem struct {
 // ScanResult holds all detected items and planned actions.
 type ScanResult struct {
 	RootPath     string
+	MoviePath    string
+	ShowPath     string
 	Separator    SeparatorMode
 	UseSpaces    bool
 	TotalMovies  int
@@ -75,3 +77,4 @@ type ScanResult struct {
 	Actions      []Action
 	Warnings     []string
 }
+

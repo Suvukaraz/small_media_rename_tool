@@ -134,3 +134,143 @@ func TestSpiderManHyphen(t *testing.T) {
 		})
 	}
 }
+
+func TestAdvancedEpisodeParsing(t *testing.T) {
+	cases := []struct {
+		filename  string
+		season    int
+		episode   int
+		secondEp  int
+		matched   bool
+	}{
+		{"Breaking.Bad.S01E01.720p.mkv", 1, 1, 0, true},
+		{"Game.of.Thrones.S08E06.1080p.mkv", 8, 6, 0, true},
+		{"Dark.Staffel.1.Folge.02.mkv", 1, 2, 0, true},
+		{"Dark.Staffel 2 Folge 05.mkv", 2, 5, 0, true},
+		{"Show.St.1.Ep.03.mkv", 1, 3, 0, true},
+		{"Show.1x04.mkv", 1, 4, 0, true},
+		{"Show.S02E01-E02.mkv", 2, 1, 2, true},
+		{"Show.S02E01-02.mkv", 2, 1, 2, true},
+		{"Show.S02E01E02.mkv", 2, 1, 2, true},
+		{"Show.S02E01.E02.mkv", 2, 1, 2, true},
+		{"Inception.2010.1080p.mkv", 0, 0, 0, false},
+	}
+
+	for _, c := range cases {
+		s, ep, ep2, ok := ExtractEpisodeInfo(c.filename)
+		if ok != c.matched {
+			t.Errorf("[%s] matched=%v, want %v", c.filename, ok, c.matched)
+			continue
+		}
+		if ok {
+			if s != c.season || ep != c.episode || ep2 != c.secondEp {
+				t.Errorf("[%s] got S%02dE%02d(second:%d), want S%02dE%02d(second:%d)",
+					c.filename, s, ep, ep2, c.season, c.episode, c.secondEp)
+			}
+		}
+	}
+}
+
+func TestEpisodeInfoFromPath(t *testing.T) {
+	// 1. Standalone episode inside season folder
+	p1 := "/media/series/Stranger Things/Season 2/01 - MADMAX.mkv"
+	s, ep, _, ok := ExtractEpisodeInfoFromPath(p1)
+	if !ok || s != 2 || ep != 1 {
+		t.Errorf("ExtractEpisodeInfoFromPath(%q) = (%d, %d, %v), want (2, 1, true)", p1, s, ep, ok)
+	}
+
+	// 2. Standalone episode with E03
+	p2 := "/media/series/Breaking Bad/Season 1/E03 - And the Bag's in the River.mkv"
+	s, ep, _, ok = ExtractEpisodeInfoFromPath(p2)
+	if !ok || s != 1 || ep != 3 {
+		t.Errorf("ExtractEpisodeInfoFromPath(%q) = (%d, %d, %v), want (1, 3, true)", p2, s, ep, ok)
+	}
+
+	// 3. German Staffel folder
+	p3 := "/media/series/Dark/Staffel 3/05.mkv"
+	s, ep, _, ok = ExtractEpisodeInfoFromPath(p3)
+	if !ok || s != 3 || ep != 5 {
+		t.Errorf("ExtractEpisodeInfoFromPath(%q) = (%d, %d, %v), want (3, 5, true)", p3, s, ep, ok)
+	}
+}
+
+func TestExtractShowTitleFromFilename(t *testing.T) {
+	tests := []struct {
+		filename string
+		expected string
+	}{
+		{"Breaking.Bad.S01E01.720p.mkv", "Breaking Bad"},
+		{"Spider-Man.S01E02.1080p.mkv", "Spider-Man"},
+		{"Doctor.Who.2005.S02E03.mkv", "Doctor Who (2005)"},
+		{"Dark.Staffel.1.Folge.02.mkv", "Dark"},
+	}
+
+	for _, tt := range tests {
+		title := ExtractShowTitleFromFilename(tt.filename)
+		if title != tt.expected {
+			t.Errorf("ExtractShowTitleFromFilename(%q) = %q; want %q", tt.filename, title, tt.expected)
+		}
+	}
+}
+
+func TestEpisodeNotTreatedAsMovie(t *testing.T) {
+	episodes := []string{
+		"Breaking.Bad.S01E01.2008.720p",
+		"Dark.Staffel.1.Folge.01.2017",
+		"Doctor.Who.2005.S01E01",
+	}
+
+	for _, ep := range episodes {
+		title, year := ExtractMovieYearAndTitle(ep)
+		if title != "" || year != 0 {
+			t.Errorf("Episode %q was classified as movie: title=%q, year=%d", ep, title, year)
+		}
+	}
+}
+
+func TestLeadingYearInTitle(t *testing.T) {
+	// 1. Movie parsing tests with titles starting with year
+	movieTests := []struct {
+		input       string
+		expectTitle string
+		expectYear  int
+	}{
+		{"1999 - The best year ever.mkv", "1999 - The Best Year Ever", 0},
+		{"1999 - The best year ever (2024).mkv", "1999 - The Best Year Ever", 2024},
+		{"1999 - The best year ever (1999).mkv", "1999 - The Best Year Ever", 1999},
+		{"1999.The.Best.Year.Ever.1080p.mkv", "1999 The Best Year Ever", 0},
+		{"2001 - A Space Odyssey (1968).mkv", "2001 - A Space Odyssey", 1968},
+		{"1984 (1984).mkv", "1984", 1984},
+		{"1984.1080p.BluRay.mkv", "1984", 0},
+		{"1917 (2019).mkv", "1917", 2019},
+	}
+
+	for _, tc := range movieTests {
+		ext := filepath.Ext(tc.input)
+		base := strings.TrimSuffix(tc.input, ext)
+		title, year := ExtractMovieYearAndTitle(base)
+		if title != tc.expectTitle {
+			t.Errorf("[%s] Expected title '%s', got '%s'", tc.input, tc.expectTitle, title)
+		}
+		if year != tc.expectYear {
+			t.Errorf("[%s] Expected year %d, got %d", tc.input, tc.expectYear, year)
+		}
+	}
+
+	// 2. TV Show episode title extraction with leading year
+	tvFilename := "1999 - The Best Year Ever - S01E01.mkv"
+	tvTitle := ExtractShowTitleFromFilename(tvFilename)
+	expectedTV := "1999 - The Best Year Ever"
+	if tvTitle != expectedTV {
+		t.Errorf("ExtractShowTitleFromFilename(%q) = %q; want %q", tvFilename, tvTitle, expectedTV)
+	}
+
+	// 3. StripYearFromTitle for TV shows (leading year MUST NOT be stripped, trailing year in parens MUST be stripped)
+	if stripped := StripYearFromTitle("1999 - The Best Year Ever"); stripped != "1999 - The Best Year Ever" {
+		t.Errorf("StripYearFromTitle('1999 - The Best Year Ever') = %q, want '1999 - The Best Year Ever'", stripped)
+	}
+	if stripped := StripYearFromTitle("1999 - The Best Year Ever (2024)"); stripped != "1999 - The Best Year Ever" {
+		t.Errorf("StripYearFromTitle('1999 - The Best Year Ever (2024)') = %q, want '1999 - The Best Year Ever'", stripped)
+	}
+}
+

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"smrt/pkg/presets"
 	"smrt/pkg/renamer"
 )
 
@@ -62,7 +63,14 @@ func TestUIFlowAndCtrlU(t *testing.T) {
 	// Set input path
 	model.inputPath.SetValue(showDir)
 
-	// Focus dropdown with Tab
+	// Tab cycles from fieldMoviePath to fieldShowPath
+	m6a, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	model = m6a.(Model)
+	if model.focus != fieldShowPath {
+		t.Errorf("Expected focus to be fieldShowPath, got %v", model.focus)
+	}
+
+	// Tab cycles from fieldShowPath to fieldDropdown
 	m6, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})
 	model = m6.(Model)
 	if model.focus != fieldDropdown {
@@ -368,6 +376,17 @@ func TestTouchInPreviewAndResultScreens(t *testing.T) {
 		t.Errorf("btn_quit hitbox does not cover full screen width: minX=%d, maxX=%d", quitArea.minX, quitArea.maxX)
 	}
 
+	// Simulate touch on [Beenden] -> should return tea.Quit cmd
+	_, quitCmd := model.Update(tea.MouseMsg{
+		X:      10,
+		Y:      quitArea.minY + 1,
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	})
+	if quitCmd == nil {
+		t.Errorf("Expected tea.Quit cmd after tapping btn_quit, got nil")
+	}
+
 	// Simulate touch on [Neuer Ordner] -> should return to screenInput
 	m6, _ := model.Update(tea.MouseMsg{
 		X:      5,
@@ -671,6 +690,582 @@ func TestAndroidTouchButtonNoneInPreview(t *testing.T) {
 	}
 }
 
+func TestDualPathInputAndScanFlow(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "smrt_ui_dual_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
 
+	moviesDir := filepath.Join(tempDir, "Movies")
+	showsDir := filepath.Join(tempDir, "Shows")
+	_ = os.MkdirAll(moviesDir, 0755)
+	_ = os.MkdirAll(showsDir, 0755)
 
+	_ = os.WriteFile(filepath.Join(moviesDir, "Inception.2010.1080p.mkv"), []byte("movie"), 0644)
+	showFolder := filepath.Join(showsDir, "Loki")
+	_ = os.MkdirAll(showFolder, 0755)
+	_ = os.WriteFile(filepath.Join(showFolder, "Loki.S01E01.720p.mkv"), []byte("tv"), 0644)
+
+	m := InitialModelWithPaths(moviesDir, showsDir)
+	view1 := m.View()
+
+	if !strings.Contains(view1, "BEIDE ORDNER SCANNEN") {
+		t.Errorf("Expected dual path scan button label, got view:\n%s", view1)
+	}
+
+	// Press Enter to start scan
+	m2, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model := m2.(Model)
+
+	if model.state != screenPreview {
+		t.Fatalf("Expected screenPreview, got %v", model.state)
+	}
+	if model.scanResult == nil {
+		t.Fatalf("Expected scanResult not nil")
+	}
+	if model.scanResult.TotalMovies != 1 {
+		t.Errorf("Expected 1 movie, got %d", model.scanResult.TotalMovies)
+	}
+	if model.scanResult.TotalShows != 1 {
+		t.Errorf("Expected 1 show, got %d", model.scanResult.TotalShows)
+	}
+
+	previewView := model.View()
+	if !strings.Contains(previewView, "Movies") || !strings.Contains(previewView, "Shows") {
+		t.Errorf("Preview view should mention both folders: %s", previewView)
+	}
+
+	// Confirm rename execution
+	m3, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m3.(Model)
+	if model.state != screenResult {
+		t.Fatalf("Expected screenResult, got %v", model.state)
+	}
+
+	// Verify disk
+	expectedMovie := filepath.Join(moviesDir, "Inception (2010)", "Inception (2010).mkv")
+	expectedShow := filepath.Join(showsDir, "Loki", "Loki - S01E01.mkv")
+	if _, err := os.Stat(expectedMovie); os.IsNotExist(err) {
+		t.Errorf("Expected movie %s does not exist", expectedMovie)
+	}
+	if _, err := os.Stat(expectedShow); os.IsNotExist(err) {
+		t.Errorf("Expected show %s does not exist", expectedShow)
+	}
+}
+
+func TestDualPathTouchAreasAndFocusSwitching(t *testing.T) {
+	m := InitialModel()
+	m.width = 60
+	m.height = 25
+	_ = m.View()
+
+	var movieArea, showArea *clickArea
+	for _, a := range *m.clickAreas {
+		if a.id == "input_movie" {
+			movieArea = &a
+		} else if a.id == "input_show" {
+			showArea = &a
+		}
+	}
+	if movieArea == nil {
+		t.Fatalf("Could not find input_movie area")
+	}
+	if showArea == nil {
+		t.Fatalf("Could not find input_show area")
+	}
+
+	// Tap show input area
+	m2, _ := m.Update(tea.MouseMsg{
+		X:      showArea.minX + 6,
+		Y:      showArea.minY + 1,
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	})
+	model := m2.(Model)
+	if model.focus != fieldShowPath {
+		t.Errorf("Expected focus to be fieldShowPath after tap, got %v", model.focus)
+	}
+
+	// Type into show input
+	m3, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a', 'b', 'c'}})
+	model = m3.(Model)
+	if model.inputShowPath.Value() != "abc" {
+		t.Errorf("Expected showPath to have 'abc', got %s", model.inputShowPath.Value())
+	}
+	if model.inputMoviePath.Value() != "" {
+		t.Errorf("moviePath should remain empty, got %s", model.inputMoviePath.Value())
+	}
+
+	// Tap movie input area
+	_ = model.View()
+	m4, _ := model.Update(tea.MouseMsg{
+		X:      movieArea.minX + 6,
+		Y:      movieArea.minY + 1,
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	})
+	model = m4.(Model)
+	if model.focus != fieldMoviePath {
+		t.Errorf("Expected focus to be fieldMoviePath after tap, got %v", model.focus)
+	}
+
+	// Type into movie input
+	m5, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x', 'y', 'z'}})
+	model = m5.(Model)
+	if model.inputMoviePath.Value() != "xyz" {
+		t.Errorf("Expected moviePath to have 'xyz', got %s", model.inputMoviePath.Value())
+	}
+	if model.inputShowPath.Value() != "abc" {
+		t.Errorf("showPath should still have 'abc', got %s", model.inputShowPath.Value())
+	}
+}
+
+func TestPresetsSubmenuNavigationAndShortcuts(t *testing.T) {
+	tempFile := filepath.Join(t.TempDir(), "presets.json")
+	pm, err := presets.LoadFrom(tempFile)
+	if err != nil {
+		t.Fatalf("Failed to create preset manager: %v", err)
+	}
+
+	m := InitialModelWithPresets("", "", pm)
+	m.width = 60
+	m.height = 25
+
+	if m.state != screenInput {
+		t.Fatalf("Expected screenInput, got %v", m.state)
+	}
+
+	// 1. Open presets submenu via ctrl+p
+	m2, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	model := m2.(Model)
+	if model.state != screenPresets {
+		t.Fatalf("Expected screenPresets after Ctrl+P, got %v", model.state)
+	}
+
+	// 2. Press Esc to return to screenInput
+	m3, _ := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = m3.(Model)
+	if model.state != screenInput {
+		t.Fatalf("Expected screenInput after Esc, got %v", model.state)
+	}
+
+	// 3. Open presets submenu via clicking btn_presets
+	_ = model.View()
+	var presetsBtnArea *clickArea
+	for _, a := range *model.clickAreas {
+		if a.id == "btn_presets" {
+			presetsBtnArea = &a
+			break
+		}
+	}
+	if presetsBtnArea == nil {
+		t.Fatalf("Could not find btn_presets click area")
+	}
+
+	m4, _ := model.Update(tea.MouseMsg{
+		X:      presetsBtnArea.minX + 2,
+		Y:      presetsBtnArea.minY,
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	})
+	model = m4.(Model)
+	if model.state != screenPresets {
+		t.Fatalf("Expected screenPresets after clicking btn_presets, got %v", model.state)
+	}
+
+	// 4. Test Tab cycling in presets screen
+	if model.presetFocus != presetFieldNum {
+		t.Errorf("Expected initial focus on presetFieldNum, got %v", model.presetFocus)
+	}
+	m5, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	model = m5.(Model)
+	if model.presetFocus != presetFieldPath {
+		t.Errorf("Expected presetFieldPath after 1 Tab, got %v", model.presetFocus)
+	}
+	m6, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	model = m6.(Model)
+	if model.presetFocus != presetFieldSave {
+		t.Errorf("Expected presetFieldSave after 2 Tabs, got %v", model.presetFocus)
+	}
+	m7, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	model = m7.(Model)
+	if model.presetFocus != presetFieldDelete {
+		t.Errorf("Expected presetFieldDelete after 3 Tabs, got %v", model.presetFocus)
+	}
+	m8, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	model = m8.(Model)
+	if model.presetFocus != presetFieldBack {
+		t.Errorf("Expected presetFieldBack after 4 Tabs, got %v", model.presetFocus)
+	}
+	m9, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	model = m9.(Model)
+	if model.presetFocus != presetFieldNum {
+		t.Errorf("Expected presetFieldNum after 5 Tabs, got %v", model.presetFocus)
+	}
+
+	// Shift+Tab backward cycling
+	m10, _ := model.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	model = m10.(Model)
+	if model.presetFocus != presetFieldBack {
+		t.Errorf("Expected presetFieldBack after Shift+Tab, got %v", model.presetFocus)
+	}
+
+	// Press Enter on presetFieldBack to return
+	m11, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m11.(Model)
+	if model.state != screenInput {
+		t.Errorf("Expected return to screenInput after pressing Enter on Back button, got %v", model.state)
+	}
+}
+
+func TestPresetsAddDeleteAndClickItem(t *testing.T) {
+	tempFile := filepath.Join(t.TempDir(), "presets.json")
+	pm, err := presets.LoadFrom(tempFile)
+	if err != nil {
+		t.Fatalf("Failed to create preset manager: %v", err)
+	}
+
+	m := InitialModelWithPresets("", "", pm)
+	m.width = 60
+	m.height = 25
+	m.state = screenPresets
+
+	// Set preset 1 -> /media/movies
+	m.presetNumInput.SetValue("1")
+	m.presetPathInput.SetValue("/media/movies")
+	m.presetFocus = presetFieldSave
+
+	m2, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model := m2.(Model)
+
+	p1, ok1 := pm.Get(1)
+	if !ok1 || p1 != "/media/movies" {
+		t.Errorf("Expected preset 1 to be /media/movies, got %s (ok=%v)", p1, ok1)
+	}
+
+	// Verify persistence file exists and has content
+	pmReloaded, err := presets.LoadFrom(tempFile)
+	if err != nil {
+		t.Fatalf("Failed to reload presets from disk: %v", err)
+	}
+	p1Reloaded, okReloaded := pmReloaded.Get(1)
+	if !okReloaded || p1Reloaded != "/media/movies" {
+		t.Errorf("Reloaded preset 1 mismatch: %s (ok=%v)", p1Reloaded, okReloaded)
+	}
+
+	// Add preset 2 -> /media/shows
+	model.presetNumInput.SetValue("2")
+	model.presetPathInput.SetValue("/media/shows")
+	model.presetFocus = presetFieldSave
+	m3, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m3.(Model)
+
+	p2, ok2 := pm.Get(2)
+	if !ok2 || p2 != "/media/shows" {
+		t.Errorf("Expected preset 2 to be /media/shows, got %s (ok=%v)", p2, ok2)
+	}
+
+	// Render presets view and check content
+	view := model.View()
+	if !strings.Contains(view, "#01") || !strings.Contains(view, "/media/movies") {
+		t.Errorf("View missing preset 1 info:\n%s", view)
+	}
+	if !strings.Contains(view, "#02") || !strings.Contains(view, "/media/shows") {
+		t.Errorf("View missing preset 2 info:\n%s", view)
+	}
+
+	// Test clicking preset_item_1
+	var item1Area *clickArea
+	for _, a := range *model.clickAreas {
+		if a.id == "preset_item_1" {
+			item1Area = &a
+			break
+		}
+	}
+	if item1Area == nil {
+		t.Fatalf("Could not find preset_item_1 click area")
+	}
+
+	// Clear inputs first
+	model.presetNumInput.SetValue("")
+	model.presetPathInput.SetValue("")
+
+	m4, _ := model.Update(tea.MouseMsg{
+		X:      item1Area.minX + 2,
+		Y:      item1Area.minY,
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	})
+	model = m4.(Model)
+
+	if model.presetNumInput.Value() != "1" {
+		t.Errorf("Expected presetNumInput to be '1' after tapping item, got %s", model.presetNumInput.Value())
+	}
+	if model.presetPathInput.Value() != "/media/movies" {
+		t.Errorf("Expected presetPathInput to be '/media/movies' after tapping item, got %s", model.presetPathInput.Value())
+	}
+
+	// Delete preset 1
+	model.presetFocus = presetFieldDelete
+	m5, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m5.(Model)
+
+	if _, ok := pm.Get(1); ok {
+		t.Errorf("Expected preset 1 to be deleted, but still exists")
+	}
+	if p2After, ok := pm.Get(2); !ok || p2After != "/media/shows" {
+		t.Errorf("Preset 2 should still exist, got %s (ok=%v)", p2After, ok)
+	}
+
+	// Test clicking preset_btn_back
+	_ = model.View()
+	var backBtnArea *clickArea
+	for _, a := range *model.clickAreas {
+		if a.id == "preset_btn_back" {
+			backBtnArea = &a
+			break
+		}
+	}
+	if backBtnArea == nil {
+		t.Fatalf("Could not find preset_btn_back click area")
+	}
+
+	m6, _ := model.Update(tea.MouseMsg{
+		X:      backBtnArea.minX + 2,
+		Y:      backBtnArea.minY,
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	})
+	model = m6.(Model)
+	if model.state != screenInput {
+		t.Errorf("Expected return to screenInput after clicking Back button, got %v", model.state)
+	}
+}
+
+func TestPresetsResolutionInMainScreen(t *testing.T) {
+	tempDir := t.TempDir()
+	moviesDir := filepath.Join(tempDir, "Movies")
+	showsDir := filepath.Join(tempDir, "Shows")
+	_ = os.MkdirAll(moviesDir, 0755)
+	_ = os.MkdirAll(showsDir, 0755)
+
+	_ = os.WriteFile(filepath.Join(moviesDir, "Dune.2021.mkv"), []byte("movie"), 0644)
+	_ = os.WriteFile(filepath.Join(showsDir, "Dark.S01E01.mkv"), []byte("show"), 0644)
+
+	tempFile := filepath.Join(tempDir, "presets.json")
+	pm, err := presets.LoadFrom(tempFile)
+	if err != nil {
+		t.Fatalf("Failed to create preset manager: %v", err)
+	}
+	_ = pm.Set(1, moviesDir)
+	_ = pm.Set(2, showsDir)
+
+	// User types numbers "1" and "2" instead of full paths
+	m := InitialModelWithPresets("1", "2", pm)
+	m.width = 60
+	m.height = 25
+
+	view := m.View()
+	if !strings.Contains(view, "↳ Preset: "+moviesDir) {
+		t.Errorf("Expected movie preset indicator in view:\n%s", view)
+	}
+	if !strings.Contains(view, "↳ Preset: "+showsDir) {
+		t.Errorf("Expected show preset indicator in view:\n%s", view)
+	}
+
+	// Press Enter to start scan
+	m2, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model := m2.(Model)
+
+	if model.state != screenPreview {
+		t.Fatalf("Expected screenPreview, got %v", model.state)
+	}
+	if model.scanResult == nil {
+		t.Fatalf("Expected non-nil scanResult")
+	}
+	if model.scanResult.TotalMovies != 1 {
+		t.Errorf("Expected 1 movie, got %d", model.scanResult.TotalMovies)
+	}
+	if model.scanResult.TotalShows != 1 {
+		t.Errorf("Expected 1 show, got %d", model.scanResult.TotalShows)
+	}
+}
+
+func TestResultScreenRedesignAndTouch(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "smrt_result_ui_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	m := InitialModel()
+	m.width = 40
+	m.height = 20
+	m.state = screenResult
+	m.execResult = &renamer.ExecutionResult{
+		SuccessCount: 5,
+		ErrorCount:   0,
+	}
+
+	// 1. Mobile View Rendering & Hitbox Validation
+	view := m.View()
+	if !strings.Contains(view, "Alles erledigt") {
+		t.Errorf("Expected success hero card in view:\n%s", view)
+	}
+	if !strings.Contains(view, "NEUER ORDNER") || !strings.Contains(view, "BEENDEN") {
+		t.Errorf("Expected NEUER ORDNER and BEENDEN buttons in view:\n%s", view)
+	}
+
+	areas := make(map[string]clickArea)
+	for _, a := range *m.clickAreas {
+		areas[a.id] = a
+	}
+
+	newArea, hasNew := areas["btn_new"]
+	quitArea, hasQuit := areas["btn_quit"]
+	if !hasNew || !hasQuit {
+		t.Fatalf("Expected btn_new and btn_quit in clickAreas")
+	}
+
+	// Verify continuous seamless mobile hitboxes without dead zones
+	if newArea.maxY+1 != quitArea.minY {
+		t.Errorf("Dead zone found between new and quit buttons: new.maxY=%d, quit.minY=%d", newArea.maxY, quitArea.minY)
+	}
+	if quitArea.maxY < m.height-1 {
+		t.Errorf("quit button does not cover bottom of screen: quit.maxY=%d, height=%d", quitArea.maxY, m.height)
+	}
+
+	// Tap btn_quit at bottom of screen
+	_, quitCmd := m.Update(tea.MouseMsg{
+		X:      20,
+		Y:      m.height - 1,
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	})
+	if quitCmd == nil {
+		t.Errorf("Expected tea.Quit after tapping bottom of screen")
+	}
+
+	// Tap btn_new
+	mNew, _ := m.Update(tea.MouseMsg{
+		X:      20,
+		Y:      newArea.minY,
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	})
+	modelNew := mNew.(Model)
+	if modelNew.state != screenInput {
+		t.Errorf("Expected state screenInput after tapping btn_new, got %v", modelNew.state)
+	}
+
+	// 2. Keyboard Navigation (Tab toggles focus between Neuer Ordner and Beenden)
+	mKey := InitialModel()
+	mKey.width = 80
+	mKey.height = 24
+	mKey.state = screenResult
+	mKey.execResult = &renamer.ExecutionResult{
+		SuccessCount: 3,
+		ErrorCount:   0,
+	}
+	mKey.resultFocus = resultFieldNew
+
+	// Press Tab -> switch focus to resultFieldQuit
+	mTab1, _ := mKey.Update(tea.KeyMsg{Type: tea.KeyTab})
+	modelTab1 := mTab1.(Model)
+	if modelTab1.resultFocus != resultFieldQuit {
+		t.Errorf("Expected resultFocus to be resultFieldQuit, got %v", modelTab1.resultFocus)
+	}
+
+	// Press Enter when focused on Quit -> tea.Quit
+	_, enterQuitCmd := modelTab1.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if enterQuitCmd == nil {
+		t.Errorf("Expected tea.Quit cmd when pressing Enter on focused quit button")
+	}
+
+	// Press Tab again -> switch focus back to resultFieldNew
+	mTab2, _ := modelTab1.Update(tea.KeyMsg{Type: tea.KeyTab})
+	modelTab2 := mTab2.(Model)
+	if modelTab2.resultFocus != resultFieldNew {
+		t.Errorf("Expected resultFocus to be resultFieldNew, got %v", modelTab2.resultFocus)
+	}
+
+	// Press Enter when focused on New -> return to screenInput
+	mEnterNew, _ := modelTab2.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	modelEnterNew := mEnterNew.(Model)
+	if modelEnterNew.state != screenInput {
+		t.Errorf("Expected state screenInput when pressing Enter on focused new button, got %v", modelEnterNew.state)
+	}
+
+	// Press 'q' or 'esc' -> immediate quit
+	_, qCmd := modelTab2.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if qCmd == nil {
+		t.Errorf("Expected tea.Quit cmd when pressing 'q'")
+	}
+}
+
+func TestResultScreenTermiusAndVariousWidths(t *testing.T) {
+	// Test at width 58 (typical Termius portrait mode) and width 32 (compact mobile)
+	widths := []int{32, 58, 80, 120}
+
+	for _, w := range widths {
+		m := InitialModel()
+		m.width = w
+		m.height = 24
+		m.state = screenResult
+		m.execResult = &renamer.ExecutionResult{
+			SuccessCount: 2,
+			ErrorCount:   0,
+		}
+
+		view := m.View()
+		if !strings.Contains(view, "Alles erledigt") {
+			t.Errorf("[Width %d] Expected 'Alles erledigt' in view:\n%s", w, view)
+		}
+		if !strings.Contains(view, "[ NEUER ORDNER ]") {
+			t.Errorf("[Width %d] Expected '[ NEUER ORDNER ]' in view:\n%s", w, view)
+		}
+		if !strings.Contains(view, "[ BEENDEN ]") {
+			t.Errorf("[Width %d] Expected '[ BEENDEN ]' in view:\n%s", w, view)
+		}
+
+		// Ensure hitboxes are valid
+		var foundNew, foundQuit bool
+		for _, a := range *m.clickAreas {
+			if a.id == "btn_new" {
+				foundNew = true
+				if a.minX < 0 || a.maxX > m.width {
+					t.Errorf("[Width %d] btn_new bounds invalid: minX=%d, maxX=%d", w, a.minX, a.maxX)
+				}
+			}
+			if a.id == "btn_quit" {
+				foundQuit = true
+				if a.minX < 0 || a.maxX > m.width {
+					t.Errorf("[Width %d] btn_quit bounds invalid: minX=%d, maxX=%d", w, a.minX, a.maxX)
+				}
+			}
+		}
+		if !foundNew || !foundQuit {
+			t.Errorf("[Width %d] Missing click areas: foundNew=%v, foundQuit=%v", w, foundNew, foundQuit)
+		}
+	}
+}
+
+func TestCheckBracket(t *testing.T) {
+	for w := 24; w <= 100; w++ {
+		m := InitialModel()
+		m.width = w
+		m.height = 24
+		m.state = screenResult
+		m.execResult = &renamer.ExecutionResult{SuccessCount: 2}
+
+		view := m.View()
+		if !strings.Contains(view, "[ NEUER ORDNER ]") {
+			t.Errorf("[Width %d] Expected '[ NEUER ORDNER ]' in view:\n%s", w, view)
+		}
+		if !strings.Contains(view, "[ BEENDEN ]") {
+			t.Errorf("[Width %d] Expected '[ BEENDEN ]' in view:\n%s", w, view)
+		}
+	}
+}
 

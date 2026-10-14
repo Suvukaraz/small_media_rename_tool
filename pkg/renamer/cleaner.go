@@ -1,6 +1,7 @@
 package renamer
 
 import (
+	"fmt"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -44,11 +45,15 @@ var sceneTagList = []string{
 	// Sources
 	"bluray", "blu-ray", "bdrip", "brrip", "web-dl", "webdl", "web-rip", "webrip", "web", "hdtv", "pdtv", "dsr", "dvdrip", "dvd", "remux", "vhs",
 	// Audio
-	"ddp5.1", "dd5.1", "ddp", "dts-hd", "dts", "ac3", "eac3", "aac2.0", "aac", "flac", "truehd", "atmos", "mp3",
+	"dts-hd.ma", "dts-hd", "dts-x", "dts", "truehd", "atmos", "ddp5.1", "dd5.1", "ddp", "ac3", "eac3", "aac2.0", "aac", "flac", "mp3", "5.1", "7.1",
+	// HDR & Video details
+	"hdr10plus", "hdr10+", "hdr10", "hdr", "dovi", "dv", "sdr",
+	// Streaming sources
+	"amzn", "nf", "dsnp", "atvp", "hmax", "itunes",
 	// Languages & editions
-	"german", "dl", "dubbed", "multi", "subbed", "eng", "ita", "french",
+	"german", "deutsch", "dl", "dubbed", "multi", "subbed", "eng", "english", "ita", "french",
 	// Release tags & junk
-	"proper", "repack", "rerip", "internal", "unrated", "extended", "directors.cut", "remastered", "imax", "sample",
+	"proper", "repack", "rerip", "internal", "unrated", "extended", "directors.cut", "theatrical", "remastered", "imax", "sample", "complete",
 }
 
 // Compile a unified delimiter-aware scene tag regex
@@ -61,17 +66,40 @@ var sceneTagPattern = func() *regexp.Regexp {
 	return regexp.MustCompile(pattern)
 }()
 
-// Regex to detect TV episode notation (e.g., S01E02, s1e2, 1x02, S01E01-E02, S01E01E02)
+// Regex to detect TV episode notation
 var (
-	tvPatternSxxExx    = regexp.MustCompile(`(?i)[._\s\-\[](?:s|season\s*)(\d{1,2})\s*(?:e|ep|episode\s*)(\d{1,3})(?:(?:\s*-\s*|\s*e|\s*ep)(\d{1,3}))?`)
-	tvPatternNxNN      = regexp.MustCompile(`(?i)[._\s\-\[](\d{1,2})x(\d{1,3})(?:-(\d{1,3}))?`)
-	tvSeasonTagPattern = regexp.MustCompile(`(?i)[._\s\-\[](?:s\d{1,2}(?:\s*-\s*s?\d{1,2})?|season\s*\d{1,2}(?:\s*-\s*\d{1,2})?|staffel\s*\d{1,2}(?:\s*-\s*\d{1,2})?|complete)(?:[._\s\-\]]|\z)`)
-	yearPattern        = regexp.MustCompile(`(?i)(?:[-(._\s]|\A)(?:[\[(])?(19\d{2}|20\d{2})(?:[\])])?(?:[-(._\s]|\z)`)
+	// S01E02, s1e2, S01.E02, S01_E02, S01E01-E02, S01E01-02, S01E01E02, S01E01.E02
+	tvPatternSxxExx = regexp.MustCompile(`(?i)[._\s\-\[](?:s|season\s*)(\d{1,2})[._\s\-]*(?:e|ep|episode\s*)(\d{1,3})(?:(?:\s*-\s*e?|\s*[._+]\s*e|\s*e|\s*ep)(\d{1,3}))?`)
+	// 1x02, 01x02, 1x01-02
+	tvPatternNxNN   = regexp.MustCompile(`(?i)[._\s\-\[](\d{1,2})x(\d{1,3})(?:-(\d{1,3}))?`)
+	// German notation: Staffel 1 Folge 2, Staffel.1.Folge.02, St.1 Ep.2
+	tvPatternGerman = regexp.MustCompile(`(?i)[._\s\-\[](?:staffel|st)[._\s\-]*(\d{1,2})[._\s\-]*(?:folge|episode|ep|flg)[._\s\-]*(\d{1,3})(?:[._\s\-]*(?:folge|episode|ep|flg|-)[._\s\-]*(\d{1,3}))?`)
+	// Standalone episode: E01, EP01, Folge 01, Episode 01 (without season)
+	tvPatternStandaloneEp = regexp.MustCompile(`(?i)(?:[._\s\-\[]|^)(?:e|ep|folge|episode)[._\s\-]*(\d{1,3})(?:[._\s\-]*(?:e|ep|folge|episode|-)[._\s\-]*(\d{1,3}))?(?:[._\s\-\]]|\z)`)
+	// Leading number in filename (e.g. "01 - Title.mkv" or "01.mkv")
+	tvPatternLeadingEp    = regexp.MustCompile(`^(\d{1,3})(?:[._\s\-]|$)`)
+	tvPatternPartEp       = regexp.MustCompile(`(?i)(?:[._\s\-\[]|^)(?:part|teil|pt)[._\s\-]*(\d{1,3})(?:[._\s\-\]]|\z)`)
+	tvPatternDashEp       = regexp.MustCompile(`(?i)(?:[._\s]|\A)-\s*(\d{1,3})(?:[._\s\-\]]|\z)`)
+	tvSeasonFolderPattern = regexp.MustCompile(`(?i)(?:^|[._\s\-\[])(?:season|staffel|st|s)[._\s\-]*(\d{1,2})(?:[._\s\-\]]|$)`)
+	tvSeasonTagPattern    = regexp.MustCompile(`(?i)[._\s\-\[](?:s\d{1,2}(?:\s*-\s*s?\d{1,2})?|season\s*\d{1,2}(?:\s*-\s*\d{1,2})?|staffel\s*\d{1,2}(?:\s*-\s*\d{1,2})?|complete)(?:[._\s\-\]]|\z)`)
+	yearPattern           = regexp.MustCompile(`(?i)(?:[-(._\s]|\A)(?:[\[(])?(19\d{2}|20\d{2})(?:[\])])?(?:[-(._\s]|\z)`)
 )
+
+// ExtractSeasonFromFolder extracts season number if folder name matches "Season 1", "Staffel 02", "S01", "Staffel_1", etc.
+func ExtractSeasonFromFolder(folderName string) int {
+	clean := strings.TrimSpace(folderName)
+	if m := tvSeasonFolderPattern.FindStringSubmatch(clean); len(m) > 1 {
+		s, err := strconv.Atoi(m[1])
+		if err == nil {
+			return s
+		}
+	}
+	return 0
+}
 
 // ExtractEpisodeInfo checks if a filename contains TV show season & episode markers.
 func ExtractEpisodeInfo(name string) (season, episode, ep2 int, matched bool) {
-	// First try S01E02 format
+	// 1. Try S01E02 format
 	if m := tvPatternSxxExx.FindStringSubmatch(name); len(m) > 2 {
 		s, err1 := strconv.Atoi(m[1])
 		e, err2 := strconv.Atoi(m[2])
@@ -84,7 +112,20 @@ func ExtractEpisodeInfo(name string) (season, episode, ep2 int, matched bool) {
 		}
 	}
 
-	// Try 1x02 format
+	// 2. Try German notation (Staffel 1 Folge 2)
+	if m := tvPatternGerman.FindStringSubmatch(name); len(m) > 2 {
+		s, err1 := strconv.Atoi(m[1])
+		e, err2 := strconv.Atoi(m[2])
+		if err1 == nil && err2 == nil {
+			second := 0
+			if len(m) > 3 && m[3] != "" {
+				second, _ = strconv.Atoi(m[3])
+			}
+			return s, e, second, true
+		}
+	}
+
+	// 3. Try 1x02 format
 	if m := tvPatternNxNN.FindStringSubmatch(name); len(m) > 2 {
 		s, err1 := strconv.Atoi(m[1])
 		e, err2 := strconv.Atoi(m[2])
@@ -100,8 +141,147 @@ func ExtractEpisodeInfo(name string) (season, episode, ep2 int, matched bool) {
 	return 0, 0, 0, false
 }
 
+// ExtractEpisodeInfoFromPath checks the filename and parent directory hierarchy to detect season & episode.
+func ExtractEpisodeInfoFromPath(fullPath string) (season, episode, ep2 int, matched bool) {
+	fileName := filepath.Base(fullPath)
+	s, e, e2, ok := ExtractEpisodeInfo(fileName)
+	if ok {
+		return s, e, e2, true
+	}
+
+	// Try standalone episode in filename: e.g. "Show - E01.mkv" or "Show - Folge 02.mkv"
+	if m := tvPatternStandaloneEp.FindStringSubmatch(fileName); len(m) > 1 {
+		ep, err := strconv.Atoi(m[1])
+		if err == nil {
+			second := 0
+			if len(m) > 2 && m[2] != "" {
+				second, _ = strconv.Atoi(m[2])
+			}
+			parentDir := filepath.Base(filepath.Dir(fullPath))
+			seasonNum := ExtractSeasonFromFolder(parentDir)
+			if seasonNum <= 0 {
+				seasonNum = 1 // Default to season 1
+			}
+			return seasonNum, ep, second, true
+		}
+	}
+
+	// Try Part 1 / Teil 1 notation in filename
+	if m := tvPatternPartEp.FindStringSubmatch(fileName); len(m) > 1 {
+		ep, err := strconv.Atoi(m[1])
+		if err == nil {
+			parentDir := filepath.Base(filepath.Dir(fullPath))
+			seasonNum := ExtractSeasonFromFolder(parentDir)
+			if seasonNum <= 0 {
+				seasonNum = 1
+			}
+			return seasonNum, ep, 0, true
+		}
+	}
+
+	// Try dash episode: e.g. "Show - 01.mkv"
+	if m := tvPatternDashEp.FindStringSubmatch(fileName); len(m) > 1 {
+		ep, err := strconv.Atoi(m[1])
+		if err == nil {
+			parentDir := filepath.Base(filepath.Dir(fullPath))
+			seasonNum := ExtractSeasonFromFolder(parentDir)
+			if seasonNum <= 0 {
+				seasonNum = 1
+			}
+			return seasonNum, ep, 0, true
+		}
+	}
+
+	// Try parent directory as season folder (e.g. "Season 1/01 - Pilot.mkv" or "Staffel 2/05.mkv")
+	parentDir := filepath.Base(filepath.Dir(fullPath))
+	seasonNum := ExtractSeasonFromFolder(parentDir)
+	if seasonNum > 0 {
+		baseWithoutExt := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+		if m := tvPatternLeadingEp.FindStringSubmatch(baseWithoutExt); len(m) > 1 {
+			ep, err := strconv.Atoi(m[1])
+			if err == nil {
+				return seasonNum, ep, 0, true
+			}
+		}
+	}
+
+	return 0, 0, 0, false
+}
+
+// ExtractShowTitleFromFilename extracts the series title portion from an episode filename.
+func ExtractShowTitleFromFilename(fileName string) string {
+	base := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+
+	// Find episode pattern position
+	var loc []int
+	if l := tvPatternSxxExx.FindStringIndex(base); l != nil {
+		loc = l
+	} else if l := tvPatternGerman.FindStringIndex(base); l != nil {
+		loc = l
+	} else if l := tvPatternNxNN.FindStringIndex(base); l != nil {
+		loc = l
+	} else if l := tvPatternStandaloneEp.FindStringIndex(base); l != nil {
+		loc = l
+	} else if l := tvPatternPartEp.FindStringIndex(base); l != nil {
+		loc = l
+	} else if l := tvPatternDashEp.FindStringIndex(base); l != nil {
+		loc = l
+	}
+
+
+	if loc != nil && loc[0] > 0 {
+		prefix := strings.Trim(base[:loc[0]], " ._-[]()")
+		clean := CleanTitle(StripSceneTags(prefix))
+		// If clean title ends with 4-digit year, e.g. "Doctor Who 2005", format as "Doctor Who (2005)"
+		locs := yearPattern.FindAllStringSubmatchIndex(clean, -1)
+		if len(locs) > 0 {
+			lastLoc := locs[len(locs)-1]
+			if lastLoc[1] == len(clean) {
+				yearStr := clean[lastLoc[2]:lastLoc[3]]
+				titlePart := strings.TrimSpace(clean[:lastLoc[0]])
+				if titlePart != "" && !strings.HasSuffix(clean, "("+yearStr+")") {
+					clean = fmt.Sprintf("%s (%s)", titlePart, yearStr)
+				}
+			}
+		}
+		if clean != "" {
+			return clean
+		}
+	}
+
+	return ""
+}
+
+// StripYearFromTitle removes release year in parentheses e.g. " (2026)" or " [2026]" or trailing year from title.
+// For TV episodes, the year can be present in the folder name, but MUST NOT be in the episode filenames.
+func StripYearFromTitle(title string) string {
+	trimmed := strings.TrimSpace(title)
+	// Match trailing (YYYY) or [YYYY]
+	reParenYear := regexp.MustCompile(`(?i)\s*[\[(](?:19\d{2}|20\d{2})[\])]\s*$`)
+	if reParenYear.MatchString(trimmed) {
+		res := strings.TrimSpace(reParenYear.ReplaceAllString(trimmed, ""))
+		if res != "" {
+			return res
+		}
+	}
+	// Match trailing year e.g. "Doctor Who 2005"
+	reTrailYear := regexp.MustCompile(`(?i)\s+(?:19\d{2}|20\d{2})\s*$`)
+	if reTrailYear.MatchString(trimmed) {
+		res := strings.TrimSpace(reTrailYear.ReplaceAllString(trimmed, ""))
+		if res != "" {
+			return res
+		}
+	}
+	return trimmed
+}
+
 // ExtractMovieYearAndTitle parses movie name and separates clean title from release year.
 func ExtractMovieYearAndTitle(baseName string) (title string, year int) {
+	// If the name explicitly matches TV episode notation, it is NOT a movie!
+	if _, _, _, isTV := ExtractEpisodeInfo(baseName); isTV {
+		return "", 0
+	}
+
 	// Find all 4-digit years between 1900 and 2099
 	locs := yearPattern.FindAllStringSubmatchIndex(baseName, -1)
 	if len(locs) > 0 {
@@ -277,4 +457,28 @@ func IsMediaFile(path string) bool {
 func IsSubtitleFile(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	return SubtitleExtensions[ext]
+}
+
+var partPattern = regexp.MustCompile(`(?i)[._\s\-\[](?:cd|part|pt|disc|disk)[._\s\-]*(\d{1,2})(?:[._\s\-\]]|\z)`)
+
+// ExtractPartInfo checks if a video file has multi-part markers (e.g. CD1, Part 2, Disc 1).
+func ExtractPartInfo(name string) int {
+	if m := partPattern.FindStringSubmatch(name); len(m) > 1 {
+		if p, err := strconv.Atoi(m[1]); err == nil && p > 0 {
+			return p
+		}
+	}
+	return 0
+}
+
+// IsSampleOrTrailer checks if a file is a sample clip or trailer.
+func IsSampleOrTrailer(name string) (bool, string) {
+	low := strings.ToLower(name)
+	if strings.Contains(low, "sample") {
+		return true, "Sample"
+	}
+	if strings.Contains(low, "trailer") {
+		return true, "Trailer"
+	}
+	return false, ""
 }

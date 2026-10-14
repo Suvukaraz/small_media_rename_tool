@@ -1,8 +1,21 @@
-# SMRT - Media Renamer & Organizer
+# SMRT - Media Renamer & Organizer (v0.3.0)
 
 Ein schnelles Go-Tool mit einer modernen, responsiven Bubble Tea TUI, das Filme und Serien automatisch erkennt, bereinigt und strukturiert umbenennt.
 
-Optimiert für **Desktop & Mobile** (z.B. Termux / SSH via Smartphone) mit voller **Maus- und Touch-Unterstützung**.
+Optimiert für **Desktop & Mobile** (z.B. Termius, Termux / SSH via Smartphone) mit voller **Maus- und Touch-Unterstützung**.
+
+---
+
+## Neu in Version 0.3.0
+
+- 🗂 **Getrennte Pfade für Filme & Serien**: Direkt im Hauptmenü oder via CLI (`-m` / `-s`) separate Ordner für Filme und Serien angeben und in einem Durchgang verarbeiten.
+- 🔢 **Pfad-Presets (1–99)**: Pfade dauerhaft mit Nummern (1 bis 99) verknüpfen. Im Hauptfenster oder per CLI einfach z. B. `1` oder `1 2` eingeben. Inklusive interaktivem Preset-Manager (`Strg + P` oder Touch-Button).
+- 📺 **Intelligente Serien-Jahreszahlen**: Erscheinungsjahre im Serienordner (`Monster - The Lizzie Borden Story (2026)/`) bleiben erhalten, werden aber bei den Einzelepisoden weggelassen (`Monster - The Lizzie Borden Story - S01E01.mkv`). Titel, die mit einer Jahreszahl beginnen (z. B. `1999 - The best year ever`), bleiben stets intakt.
+- 📱 **Mobile & Termius TUI Rework**:
+  - Touch-Karten im vertikalen Stack mit Vollbreiten-Hitboxen.
+  - Signalanroter Beenden-Button `[ ✖ Beenden ]` im Ergebnis-Screen.
+  - Automatisches Schließen der Bildschirmtastatur auf Smartphones beim Wechsel zu Vorschau/Ergebnis (`\x1b[?25l`).
+  - Schutz vor Schriftart-Drift bei Terminal-Buttons und responsiver mehrzeiliger Footer für schmale Displays (< 75 Spalten).
 
 ---
 
@@ -45,20 +58,18 @@ Optimiert für **Desktop & Mobile** (z.B. Termux / SSH via Smartphone) mit volle
    - Dateisystem-Überschreibschutz vor unbeabsichtigtem Überschreiben vorhandener Dateien.
 
 5. **Perfekte Touch- & Maus-Bedienung über alle Fenster**:
-   - **Kein Terminal-Scrollen (Zero-Drift)**: Alle Ansichten (Eingabe mit offenem/geschlossenem Dropdown, Vorschau mit Viewport, Ergebnis) passen ihre Höhe dynamisch so an, dass das Terminal niemals scrollt. Dadurch stimmen Touch- und Mauskoordinaten (`msg.Y`) zu 100% zeilengenau mit den Bedienelementen überein.
-   - **Kein Doppel-Auslösen (Press/Release Deduplication)**: Taps auf Touchscreens oder Mausklicks lösen genau einmal aus. Das Heben des Fingers nach einem Klick schließt das Dropdown nicht mehr versehentlich und löst keine Folgebuttons aus.
+   - **Kein Terminal-Scrollen (Zero-Drift)**: Alle Ansichten passen ihre Höhe dynamisch an die Terminalgröße an, sodass Koordinaten immer zeilengenau stimmen.
+   - **Kein Doppel-Auslösen (Press/Release Deduplication)**: Touch-Taps und Klicks lösen verlässlich genau einmal aus.
    - **Hauptfenster (Eingabe)**:
-     - Große Touch-Box für den Pfad inklusive direktem Cursor-Setzen per Fingertipp auf die gewünschte Textstelle.
-     - Schlankes, fingerfreundliches Dropdown für Trennzeichen (`Leerzeichen`, `Punkt`, `Unterstrich`) mit Sofort-Auswahl per Touch und visueller Aktivitätsanzeige.
-     - Schnelltaste `Strg + U` zum Durchwechseln ohne das Textfeld verlassen zu müssen.
-     - Großer, kontrastreicher `[ ▶ LET'S GO ]` Touch-Button.
+     - Große Touch-Boxen für Film- und Serienpfad.
+     - Schlankes Dropdown für Trennzeichen (`Leerzeichen`, `Punkt`, `Unterstrich`).
+     - Schnellzugriff auf Presets via `[ ⚡ Presets (1-99) ]` oder `Strg + P`.
+     - Großer `[ ▶ LET'S GO ]` Touch-Button.
    - **Vorschaufenster (Screen 2)**:
-     - **Vollflächige Touch-Buttons**: Auf Smartphones gestapelte Touch-Karten (`[ ✔ JETZT UMBENENNEN ]` und `[ ✖ Abbrechen / Zurück ]`) mit Daumen-Hitbox über die gesamte Bildschirmbreite. Auf Desktop mit exakt begrenzten Schaltflächen (keine Geisterklicks im leeren Rand).
-     - **Touch-Scrolling**: Zusätzliche Touch-Buttons `[ ▲ Nach oben ]` & `[ ▼ Nach unten ]`, Scrollen per oberer/unterer Bildschirmhälfte sowie klassisches Mausrad.
-     - **Dynamische Viewport-Höhe**: Berechnet die verfügbare Zeilenhöhe mathematisch exakt, sodass alle Buttons immer voll sichtbar und erreichbar bleiben.
+     - Gestapelte Touch-Karten (`[ ✔ JETZT UMBENENNEN ]` und `[ ✖ Abbrechen / Zurück ]`) mit Daumen-Hitbox über die gesamte Bildschirmbreite.
+     - Scrollen per Buttons `[ ▲ ]` / `[ ▼ ]`, Touch-Gesten oder Mausrad.
    - **Ergebnisfenster (Screen 3)**:
-     - Große, fingerfreundliche Touch-Karten für `[ ✔ Neuer Ordner ]` und `[ ✖ Beenden ]`.
-   - **Mathematisch exakte Hitboxen**: Alle Schaltflächen, Dropdowns und Optionen reagieren verlässlich auf Desktop-Mäuse, Touchscreens und mobile Terminals (z.B. Termux).
+     - Touch-Karten für `[ ✔ Neuer Scan / Ordner ]` und roter `[ ✖ Beenden ]` Button.
 
 ---
 
@@ -68,24 +79,34 @@ Optimiert für **Desktop & Mobile** (z.B. Termux / SSH via Smartphone) mit volle
 # Bauen
 go build -o smrt .
 
-# Starten
+# Starten (Interaktive TUI)
 ./smrt
 
-# Optional mit direkt übergebenem Pfad:
-./smrt /pfad/zu/mediendateien
+# Mit Pfad oder Preset-Nummer (1-99):
+./smrt 1
+./smrt /pfad/zu/filmen
+
+# Beide Pfade (Filme & Serien) übergeben:
+./smrt 1 2
+./smrt -m /pfad/zu/filmen -s /pfad/zu/serien
+
+# Version und Hilfe anzeigen:
+./smrt -v
+./smrt -h
 ```
 
 ## Steuerung im TUI
 
 - **Maus / Touch**:
-  - Direkt auf das Eingabefeld tippen, um es zu fokussieren
+  - Direkt auf das jeweilige Eingabefeld tippen, um es zu fokussieren
   - Auf das Dropdown tippen, um die Optionen aufzuklappen und auszuwählen
-  - In der Vorschau: `[ JETZT UMBENENNEN ]`, `[ Abbrechen ]` oder Scroll-Buttons per Fingertipp bedienen
-  - Im Ergebnis: `[ Neuer Ordner ]` oder `[ Beenden ]` antippen
-  - Mausrad oder Touch-Gesten zum Scrollen im Vorschaufenster
+  - `[ ⚡ Presets (1-99) ]` tippen für das Preset-Untermenü
+  - In der Vorschau: `[ JETZT UMBENENNEN ]`, `[ Abbrechen ]` oder Scroll-Buttons antippen
+  - Im Ergebnis: `[ Neuer Scan / Ordner ]` oder `[ Beenden ]` antippen
 - **Tastatur**:
+  - `Strg + P`: Preset-Manager öffnen / schließen
   - `Strg + U`: Trennzeichen direkt umschalten (Leerzeichen ➔ Punkt ➔ Unterstrich)
-  - `Tab` / `↑` / `↓`: Zwischen Elementen bzw. im offenen Dropdown wechseln
-  - `Enter`: Dropdown öffnen/schließen, Scan starten oder Umbenennung bestätigen
-  - `Esc`: Dropdown schließen bzw. aus der Vorschau zurückkehren
+  - `Tab` / `Shift + Tab` / `↑` / `↓`: Zwischen Feldern wechseln
+  - `Enter`: Aktion ausführen / Scan starten
+  - `Esc`: Zurück zum Hauptfenster
   - `Strg + C`: Beenden
